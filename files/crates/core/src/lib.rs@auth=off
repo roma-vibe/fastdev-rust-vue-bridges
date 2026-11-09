@@ -7,11 +7,14 @@
 //! - [`crypto`]: AES-256-GCM for secrets at rest, random tokens and token hashes
 //! - [`settings`]: typed access to the `settings` table
 //! - [`caller`]: [`Caller`], the user a request acts for (scopes per-user data)
-//! - [`service`]: [`Ctx`] and [`service::run`], the bootstrap shared by all services
+//! - [`service`]: [`Ctx`], [`service::main`] (one service in its own process) and
+//!   [`service::host`] (all of them in `app-all`), the bootstrap shared by all services
+//! - [`bridge`]: how services call each other ([`Ctx::call`]): in-process or over HTTP
 //!
-//! Services never read env vars, open the database or set up tracing themselves: they call
-//! [`service::run`] and get a ready [`Ctx`].
+//! Services never read env vars, open the database or set up tracing themselves: they are
+//! libraries with `build(ctx)` and get a ready [`Ctx`] from [`service::main`] or [`service::host`].
 
+pub mod bridge;
 pub mod caller;
 pub mod config;
 pub mod crypto;

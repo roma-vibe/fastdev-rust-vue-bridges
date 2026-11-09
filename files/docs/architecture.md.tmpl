@@ -1,11 +1,12 @@
 # Architecture
 
-The backend is a set of small Rust microservices that share one SQLite database; the **edge** is the only public entry and forwards each `/api/...` prefix to the service that owns it. The web app is a Vue single-page app built from independent feature modules.
+The backend is a set of small Rust services that share one SQLite database; the **edge** is the only public entry and forwards each `/api/...` prefix to the service that owns it. By default they all run in one process, `app-all`, and reach each other through in-process bridges; `BRIDGES=off` runs each as its own microservice on its own port, with HTTP between them (`docs/bridges.md`). The web app is a Vue single-page app built from independent feature modules.
 
 ```text
 browser / programs ──► edge :{{ ports.EDGE_PORT }}
-  (Vite :{{ ports.WEB_PORT }} in dev       │
-   proxies /api)          ├─► {% if features.auth %}identity :{{ ports.IDENTITY_PORT }}   users, sessions, API keys
+  (Vite :{{ ports.WEB_PORT }} in dev       │  ctx.call: in-process bridge (BRIDGES=on, one process app-all)
+   proxies /api)           │            or HTTP to :870x (BRIDGES=off / SEPARATE_SERVICES)
+                          ├─► {% if features.auth %}identity :{{ ports.IDENTITY_PORT }}   users, sessions, API keys
                           ├─► {% endif %}notes    :{{ ports.NOTES_PORT }}   example: notes of the caller
                           └─► web/dist         built web app (production)
 all services ──► one SQLite file (WAL), migrations in migrations/
@@ -15,18 +16,20 @@ all services ──► one SQLite file (WAL), migrations in migrations/
 
 | Path | Kind | Purpose |
 | --- | --- | --- |
-| `services.json` | registry | Service names, Cargo packages, port env keys (`<NAME>_PORT`) and the URL prefixes the edge routes. Single source for the core crate, the edge and `scripts/dev.ts`. |
-| `crates/core` (`app-core`) | library | Config from `.env` (`Config`), registry, SQLite pool + migrations, `ApiError`, {% if features.auth %}auth extractors (`AuthUser`, `AdminUser`), {% endif %}`Caller`, AES-GCM `Crypto`, settings, `service::run` bootstrap. |
-| `services/<name>` (`app-<name>`) | binary | One microservice each: `main.rs` calls `app_core::service::run(name, router)`; routes in `routes.rs`, logic in further modules, route tests in `tests.rs`. |
+| `services.json` | registry | Service names, Cargo packages, port env keys (`<NAME>_PORT`) and the URL prefixes the edge routes. Single source for the core crate, the edge, `app/` (a test keeps them in step) and the scripts. |
+| `crates/core` (`app-core`) | library | Config from `.env` (`Config`), registry, SQLite pool + migrations, `ApiError`, {% if features.auth %}auth extractors (`AuthUser`, `AdminUser`), {% endif %}`Caller`, AES-GCM `Crypto`, settings, bridges (`Ctx::call`), the bootstrap (`service::main` for one service, `service::host` for all). |
+| `services/<name>` (`app-<name>`) | library + binary | One service each: `lib.rs` has `build(ctx)` (router and background work), `main.rs` is `app_core::service::main(name, build)`; routes in `routes.rs`, logic in further modules, route tests in `tests.rs`. |
+| `app/` (`app-all`) | binary | Every service in one process over one runtime, pool and HTTP client; only the edge listens. `--plan` prints the binaries for the current settings. Tests of the whole app in all three modes. |
 | `migrations/` | SQL | Shared schema; every table has one **owner** service that writes it (the comment above the table). |
 | `web/` | SPA | Vue 3 + Tailwind 4 + vue-i18n; modules in `web/src/features/<name>` (`docs/frontend.md`). |
-| `scripts/` | Node | `setup.ts` (`.env`), `dev.ts` (all services + Vite, rebuild on change), `start.ts` (release builds). |
+| `scripts/` | Node | `setup.ts` (`.env`), `dev.ts` (services + Vite, rebuild on change), `start.ts` (release builds; execs `app-all`), `lib/topology.ts` (which processes run). |
 
 ## Rules
 
-- **Ownership.** A service writes only the tables it owns. It may read other tables; for anything else it calls the owner's HTTP API (`ctx.http` + `ctx.config.service_url("<name>")`).
+- **Ownership.** A service writes only the tables it owns. It may read other tables; for anything else it calls the owner's HTTP API with `ctx.call("<name>", request)` (a bridge: in-process or HTTP, `docs/bridges.md`), never with `ctx.http` + `service_url`.
+- **Bridges.** Services never import each other, share nothing in memory, read only headers from a request (no `ConnectInfo`), start background work in `build` and put CPU work on `spawn_blocking`. `app/src/tests.rs` checks the app in all modes.
 - **Shared code** goes to a crate in `crates/`, never copied between services. Keep `app-core` free of business logic.
-- **Schema changes** are a new numbered file in `migrations/` (never edit an applied one). Every service applies pending migrations on start (one sqlx migrator, same database, a lock file prevents races).
+- **Schema changes** are a new numbered file in `migrations/` (never edit an applied one). The bootstrap applies pending migrations on start: once in `app-all`, in every process when services run separately (one sqlx migrator, same database, a lock file prevents races).
 - **Contract.** Every endpoint is documented in `docs/api.md`; change the doc with the code.
 - **Errors** are `ApiError` (`{"error": {"code", "message"}}`), handlers return `ApiResult<Json<T>>`. No `unwrap()` outside tests.
 - **Per-user data** is scoped by `app_core::Caller` (`caller.user_id`) in every query.
@@ -37,9 +40,10 @@ all services ──► one SQLite file (WAL), migrations in migrations/
 
 1. Pick a name (e.g. `tasks`) and the next free port. Add an entry to `services.json`: `name`, `package` (`app-tasks`), `portEnv` (`TASKS_PORT`), `defaultPort`, `description`, `routes` (e.g. `["/api/tasks"]`).
 2. Add `TASKS_PORT=<port>` to `.env.example` and `.env` (and to `.env` of every copy of the project).
-3. Copy `services/notes` to `services/tasks`, rename the package in its `Cargo.toml` and the name passed to `app_core::service::run` in `main.rs`. The workspace picks up `services/*` automatically.
-4. Write the migration (next section), the model (validation), the store (SQL), the routes and route tests (`Ctx::for_tests("tasks")` + `tower::ServiceExt::oneshot`).
-5. Document the endpoints in `docs/api.md`. `npm run dev` now builds and starts the service, and the edge forwards `/api/tasks`.
+3. Copy `services/notes` to `services/tasks`, rename the package in its `Cargo.toml`, the name passed to `app_core::service::main` and the crate in `main.rs`. The workspace picks up `services/*` automatically.
+4. Link it into the one process: `app-tasks = { path = "services/tasks" }` in `[workspace.dependencies]` of the root `Cargo.toml`, `app-tasks.workspace = true` in `app/Cargo.toml`, and `("tasks", |ctx| Box::pin(app_tasks::build(ctx)))` in `SERVICES` of `app/src/main.rs`, in the order of `services.json` (a test fails otherwise).
+5. Write the migration (next section), the model (validation), the store (SQL), the routes and route tests (`Ctx::for_tests("tasks")` + `tower::ServiceExt::oneshot`); extend the journey in `app/src/tests.rs`.
+6. Document the endpoints in `docs/api.md`. `npm run dev` now builds and starts the service, and the edge forwards `/api/tasks`.
 
 ## How to add a migration
 

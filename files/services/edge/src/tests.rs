@@ -30,7 +30,7 @@ async fn edge_at(base_url: &str, web_dist: &str) -> Router {
     }
     let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let ctx = Ctx::for_tests_with("edge", &pairs).await.unwrap();
-    super::router(ctx).unwrap()
+    super::router(ctx)
 }
 
 async fn body_json(response: axum::response::Response) -> Value {

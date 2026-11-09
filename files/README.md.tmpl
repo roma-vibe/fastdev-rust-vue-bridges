@@ -1,6 +1,6 @@
 # {{ project.name }}
 
-A web app built from small Rust microservices ([axum](https://github.com/tokio-rs/axum), SQLite) behind an edge reverse proxy, and a modular [Vue 3](https://vuejs.org) single-page app.
+A web app built from small Rust services ([axum](https://github.com/tokio-rs/axum), SQLite) behind an edge, and a modular [Vue 3](https://vuejs.org) single-page app. By default the services run in one process connected by in-process bridges (about 11 MB of memory); `BRIDGES=off` runs them as separate microservices without any code change ([docs/bridges.md](docs/bridges.md)).
 
 ## Requirements
 
@@ -24,11 +24,13 @@ Production-style run on a single port:
 
 ```sh
 npm run build
-npm start         # edge: API + built web app on http://localhost:{{ ports.EDGE_PORT }}
+npm start         # edge: API + built web app on http://localhost:{{ ports.EDGE_PORT }} (one process: app-all)
 ```
 {%- if choices.docker == "run" %}
 
-In Docker (one container runs every service and serves the web app):
+`node scripts/start.ts` does the same without keeping npm in memory.
+
+In Docker (one container runs the app and serves the web app):
 
 ```sh
 docker compose up --build   # http://localhost:{{ ports.EDGE_PORT }}
@@ -39,10 +41,10 @@ docker compose up --build   # http://localhost:{{ ports.EDGE_PORT }}
 
 | Command | What it does |
 | --- | --- |
-| `npm run dev` | Builds the Rust workspace, runs every service and Vite (hot reload); Rust changes rebuild and restart the services. `-- --only notes,edge`, `-- --no-web` |
-| `npm run build` | Type-check, build the web app into `web/dist` and release binaries of every service |
-| `npm start` | Run the release builds; the edge serves the web app and the API on `EDGE_PORT` |
-| `npm test` | Vitest (web) and `cargo test --workspace` |
+| `npm run dev` | Builds the Rust workspace, runs the services (one process by default) and Vite (hot reload); Rust changes rebuild and restart the services. `-- --only notes,edge`, `-- --no-web` |
+| `npm run build` | Type-check, build the web app into `web/dist` and release binaries (`app-all` and every service) |
+| `npm start` | Run the release builds as `BRIDGES` says; the edge serves the web app and the API on `EDGE_PORT`. `-- --check` prints what would run |
+| `npm test` | Vitest (web, scripts) and `cargo test --workspace` |
 | `npm run check` | ESLint + clippy, Prettier + rustfmt, vue-tsc and all tests — the quality gate |
 | `npm run lint` / `npm run format` | Linters only / format everything |
 | `npm run setup` | Create `.env` with a fresh `MASTER_KEY`; `-- --port-base 9000` moves every port |
@@ -58,8 +60,11 @@ All settings live in `.env` in the project root, read by every service, the web 
 | `DB_PATH` | `{{ env.DB_PATH }}` | SQLite file shared by the services, relative to the project root |
 | `MASTER_KEY` | generated | Encrypts secrets at rest; keep it secret and never change it on a running installation |
 | `EDGE_PORT` | `{{ ports.EDGE_PORT }}` | Public entry: API proxy and the built web app |
+| `BRIDGES` | `on` | `on`: every service in one process (`app-all`); `off`: separate microservices |
+| `SEPARATE_SERVICES` | empty | Services that keep a process of their own with bridges on, e.g. `notes` |
+| `WORKER_THREADS` | up to 4 | Tokio worker threads of each process |
 {%- if features.auth %}
-| `IDENTITY_PORT` | `{{ ports.IDENTITY_PORT }}` | Identity service (accounts, sessions, API keys) |
+| `IDENTITY_PORT` | `{{ ports.IDENTITY_PORT }}` | Identity service (accounts, sessions, API keys); open only when it runs separately |
 {%- endif %}
 | `NOTES_PORT` | `{{ ports.NOTES_PORT }}` | Notes service (the example) |
 | `WEB_PORT` | `{{ ports.WEB_PORT }}` | Vite dev server |
@@ -74,16 +79,17 @@ All settings live in `.env` in the project root, read by every service, the web 
 ## Project structure
 
 ```text
-crates/core/     shared library: config, service registry, database, errors, crypto, bootstrap
-services/edge/   reverse proxy by services.json + the built web app
+crates/core/     shared library: config, service registry, database, errors, crypto, bridges, bootstrap
+app/             app-all: every service in one process, and the tests of the whole app
+services/edge/   forwards /api by services.json (through the bridges) + the built web app
 {%- if features.auth %}
 services/identity/  accounts, sessions, personal API keys
 {%- endif %}
 services/notes/  example service (CRUD over its own table)
-migrations/      SQL migrations, applied by every service at start
+migrations/      SQL migrations, applied at start
 web/             Vue 3 + Vite app: app shell, shared UI kit, feature modules in src/features/
 scripts/         setup, dev runner, production runner
-docs/            architecture, HTTP API, frontend modules
+docs/            architecture, bridges (one process or microservices), HTTP API, frontend modules
 ```
 
 Read `docs/architecture.md` to add a service, a migration or a web module.

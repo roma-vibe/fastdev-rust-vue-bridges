@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "services/*"]
+members = ["app", "crates/*", "services/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,9 @@ publish = false
 # Add a dependency here (not with a version in a member) so every module uses the same one.
 [workspace.dependencies]
 app-core = { path = "crates/core" }
+# The services are libraries too: `app/` links them into one process (docs/bridges.md).
+app-edge = { path = "services/edge" }
+app-notes = { path = "services/notes" }
 
 aes-gcm = "0.10"
 anyhow = "1"

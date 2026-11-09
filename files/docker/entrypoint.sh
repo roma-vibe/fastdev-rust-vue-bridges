@@ -1,11 +1,21 @@
 #!/bin/sh
-# Runs every service binary of the image (/app/bin) in one container. When one of them exits the
-# container stops (Docker restarts it per the Compose restart policy); SIGTERM stops them all.
+# Runs the app in the container as BRIDGES and SEPARATE_SERVICES say (docs/bridges.md); the rule
+# itself lives in the Rust config: `app-all --plan` prints the binaries to run.
+#
+# - One binary (the default, app-all with every service): exec, so the app is PID 1, gets SIGTERM
+#   directly and nothing else stays in memory.
+# - Several (BRIDGES=off, SEPARATE_SERVICES): runs them all; when one exits the container stops
+#   (Docker restarts it per the Compose restart policy); SIGTERM stops them all.
 set -eu
 
+plan=$(/app/bin/app-all --plan)
+if [ "$(printf '%s\n' "$plan" | wc -l)" -eq 1 ]; then
+  exec "/app/bin/$plan"
+fi
+
 pids=""
-for binary in /app/bin/*; do
-  "$binary" &
+for binary in $plan; do
+  "/app/bin/$binary" &
   pids="$pids $!"
 done
 

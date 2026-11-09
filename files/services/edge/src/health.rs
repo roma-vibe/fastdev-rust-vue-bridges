@@ -1,18 +1,22 @@
-//! `GET /api/health`: `{status: "ok"|"degraded", appName, services: [{name, ok, latencyMs, version}]}`.
+//! `GET /api/health`:
+//! `{status: "ok"|"degraded", appName, services: [{name, ok, bridged, latencyMs, version}]}`.
+//! `bridged` tells whether the service runs in this process (`docs/bridges.md`).
 
 use std::time::{Duration, Instant};
 
-use app_core::{Json, registry};
-use axum::extract::State;
+use app_core::{Ctx, Json, registry};
+use axum::{
+    body::{Body, to_bytes},
+    extract::{Request, State},
+};
 use serde::Serialize;
-
-use crate::EdgeState;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceHealth {
     name: String,
     ok: bool,
+    bridged: bool,
     latency_ms: u64,
     version: Option<String>,
 }
@@ -25,14 +29,11 @@ pub struct HealthAll {
     services: Vec<ServiceHealth>,
 }
 
-pub async fn health_all(State(state): State<EdgeState>) -> Json<HealthAll> {
+pub async fn health_all(State(ctx): State<Ctx>) -> Json<HealthAll> {
     let checks = registry::services()
         .iter()
         .filter(|s| s.name != "edge")
-        .map(|s| {
-            let url = format!("{}/health", state.ctx.config.service_url(&s.name));
-            check(state.client.clone(), s.name.clone(), url)
-        });
+        .map(|s| check(&ctx, &s.name));
     let mut services = futures::future::join_all(checks).await;
     services.sort_by(|a, b| a.name.cmp(&b.name));
     let status = if services.iter().all(|s| s.ok) {
@@ -42,30 +43,39 @@ pub async fn health_all(State(state): State<EdgeState>) -> Json<HealthAll> {
     };
     Json(HealthAll {
         status,
-        app_name: state.ctx.config.app_name.clone(),
+        app_name: ctx.config.app_name.clone(),
         services,
     })
 }
 
-async fn check(client: reqwest::Client, name: String, url: String) -> ServiceHealth {
+async fn check(ctx: &Ctx, name: &str) -> ServiceHealth {
     let started = Instant::now();
-    let result = client.get(url).timeout(Duration::from_secs(2)).send().await;
+    let version = tokio::time::timeout(Duration::from_secs(2), version_of(ctx, name))
+        .await
+        .ok()
+        .flatten();
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let (ok, version) = match result {
-        Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let version = body
-                .get("version")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            (true, version)
-        }
-        _ => (false, None),
-    };
     ServiceHealth {
-        name,
-        ok,
+        name: name.to_owned(),
+        ok: version.is_some(),
+        bridged: ctx.bridges.is_local(name),
         latency_ms,
-        version,
+        version: version.flatten(),
     }
+}
+
+/// `Some(version)` when the service answers its `/health`.
+async fn version_of(ctx: &Ctx, name: &str) -> Option<Option<String>> {
+    let req = Request::get("/health").body(Body::empty()).ok()?;
+    let response = ctx.call(name, req).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.ok()?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    Some(
+        body.get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+    )
 }

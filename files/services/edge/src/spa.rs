@@ -8,10 +8,10 @@ use axum::{
 use tower::ServiceExt as _;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::EdgeState;
+use app_core::Ctx;
 
-pub async fn serve(state: &EdgeState, req: Request) -> Response {
-    let dist = &state.ctx.config.web_dist;
+pub async fn serve(ctx: &Ctx, req: Request) -> Response {
+    let dist = &ctx.config.web_dist;
     let index = dist.join("index.html");
     if !index.exists() {
         return (

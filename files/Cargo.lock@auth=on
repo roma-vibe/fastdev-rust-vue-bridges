@@ -59,6 +59,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "app-all"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "app-core",
+ "app-edge",
+ "app-identity",
+ "app-notes",
+ "axum",
+ "futures",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "app-core"
 version = "0.1.0"
 dependencies = [
@@ -66,6 +82,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "futures",
  "hex",
  "rand 0.8.8",
  "reqwest",
@@ -90,7 +107,6 @@ dependencies = [
  "app-core",
  "axum",
  "futures",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",

@@ -24,7 +24,7 @@ Changing a shape here is a contract change: update this file in the same change 
 
 | Method | Path | Response |
 | --- | --- | --- |
-| GET | `/api/health` | `{ status: "ok" \| "degraded", appName, services: [{ name, ok, latencyMs, version }] }` |
+| GET | `/api/health` | `{ status: "ok" \| "degraded", appName, services: [{ name, ok, bridged, latencyMs, version }] }` — `bridged`: the service runs in the same process as the edge (`docs/bridges.md`) |
 
 Unknown `/api/*` paths answer a JSON 404; a service that is down answers 503 `unavailable`. Other paths serve `WEB_DIST` (the built web app, `index.html` for client-side routes).
 {% if features.auth %}

@@ -4,6 +4,8 @@ import { http } from '@/shared/api/http.ts';
 export interface ServiceHealth {
   name: string;
   ok: boolean;
+  /** Runs in the same process as the edge (docs/bridges.md). */
+  bridged: boolean;
   latencyMs: number;
   version: string | null;
 }

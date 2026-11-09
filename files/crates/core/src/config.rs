@@ -27,6 +27,10 @@ pub struct Config {
     pub web_dist: PathBuf,
     /// `LOG_LEVEL` or `RUST_LOG` filter, default `info`.
     pub log_level: String,
+    /// `BRIDGES` (default on): off means no service runs inside `app-all` (`docs/bridges.md`).
+    pub bridges: bool,
+    /// `SEPARATE_SERVICES`: comma-separated services that keep a process of their own.
+    separate: Vec<String>,
     /// Every key of `.env` and the environment, for service-specific options (`Config::var`).
     vars: HashMap<String, String>,
 }
@@ -40,6 +44,8 @@ impl fmt::Debug for Config {
             .field("db_path", &self.db_path)
             .field("bind_host", &self.bind_host)
             .field("public_url", &self.public_url)
+            .field("bridges", &self.bridges)
+            .field("separate", &self.separate)
             .finish_non_exhaustive()
     }
 }
@@ -66,7 +72,8 @@ impl Config {
     /// Builds a config from explicit values (tests).
     ///
     /// # Errors
-    /// When `MASTER_KEY` is missing.
+    /// When `MASTER_KEY` is missing, `BRIDGES` is neither on nor off, or `SEPARATE_SERVICES` names
+    /// an unknown service.
     pub fn from_vars(root_dir: PathBuf, vars: HashMap<String, String>) -> anyhow::Result<Self> {
         let get = |key: &str, default: &str| {
             vars.get(key)
@@ -94,6 +101,20 @@ impl Config {
         } else {
             format!("http://localhost:{web_port}")
         };
+        let bridges = match get("BRIDGES", "on").to_lowercase().as_str() {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            other => bail!("BRIDGES must be on or off, got {other:?}"),
+        };
+        let separate: Vec<String> = get("SEPARATE_SERVICES", "")
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if let Some(unknown) = separate.iter().find(|n| registry::service(n).is_none()) {
+            bail!("SEPARATE_SERVICES: unknown service {unknown:?} (see services.json)");
+        }
         Ok(Self {
             app_name: get("APP_NAME", "App"),
             app_slug: get("APP_SLUG", "app"),
@@ -110,6 +131,8 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "info".to_owned()),
+            bridges,
+            separate,
             root_dir,
             vars,
         })
@@ -137,8 +160,33 @@ impl Config {
             .unwrap_or(info.default_port)
     }
 
+    /// Services that run in a process of their own instead of inside `app-all`: all of them with
+    /// `BRIDGES=off`, else `SEPARATE_SERVICES`. `scripts/lib/topology.ts` applies the same rule.
+    #[must_use]
+    pub fn separate_services(&self) -> Vec<&str> {
+        if self.bridges {
+            self.separate.iter().map(String::as_str).collect()
+        } else {
+            registry::services()
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect()
+        }
+    }
+
+    /// Tokio workers of a process (`WORKER_THREADS`, default the CPU cores, at most 4): the services
+    /// only wait for the network and the database, and hash passwords on blocking threads.
+    #[must_use]
+    pub fn worker_threads(&self) -> usize {
+        self.var("WORKER_THREADS")
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get().min(4)))
+    }
+
     /// Internal base URL of service `name` for service-to-service calls, e.g. `http://127.0.0.1:8701`.
-    /// Override with `<NAME>_URL` (e.g. `NOTES_URL`) when a service runs on another host.
+    /// Override with `<NAME>_URL` (e.g. `NOTES_URL`) when a service runs on another host. Only the
+    /// bridges (`crate::bridge`) use it: services call each other with `Ctx::call`.
     #[must_use]
     pub fn service_url(&self, name: &str) -> String {
         let key = format!("{}_URL", name.to_uppercase().replace('-', "_"));
@@ -199,6 +247,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.service_url("edge"), "http://edge:1");
+    }
+
+    #[test]
+    fn bridges_decide_what_runs_separately() {
+        let load = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("MASTER_KEY", "x")];
+            all.extend_from_slice(pairs);
+            Config::from_vars(PathBuf::from("/"), vars(&all))
+        };
+        assert!(load(&[]).unwrap().bridges);
+        assert!(load(&[]).unwrap().separate_services().is_empty());
+        assert_eq!(
+            load(&[("SEPARATE_SERVICES", "notes, edge")])
+                .unwrap()
+                .separate_services(),
+            ["notes", "edge"]
+        );
+        let off = load(&[("BRIDGES", "off"), ("SEPARATE_SERVICES", "notes")]).unwrap();
+        assert_eq!(off.separate_services().len(), registry::services().len());
+        assert!(load(&[("BRIDGES", "maybe")]).is_err());
+        assert!(load(&[("SEPARATE_SERVICES", "nope")]).is_err());
+    }
+
+    #[test]
+    fn worker_threads_are_capped() {
+        let load = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("MASTER_KEY", "x")];
+            all.extend_from_slice(pairs);
+            Config::from_vars(PathBuf::from("/"), vars(&all)).unwrap()
+        };
+        assert!((1..=4).contains(&load(&[]).worker_threads()));
+        assert_eq!(load(&[("WORKER_THREADS", "2")]).worker_threads(), 2);
+        assert!(load(&[("WORKER_THREADS", "0")]).worker_threads() >= 1);
     }
 
     #[test]

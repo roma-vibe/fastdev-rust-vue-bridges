@@ -44,7 +44,8 @@ One subsection per feature: a user story, testable acceptance criteria and edge 
 ## Services
 
 <!--
-The backend is split into microservices (services.json). For each new service: its name, the URL
+The backend is split into services (services.json), which run in one process by default and as
+separate microservices with BRIDGES=off (docs/bridges.md). For each new service: its name, the URL
 prefixes it owns, the tables it owns (only the owner writes a table) and the services it calls.
 Existing: edge (public entry, proxy + web app){% if features.auth %}, identity (accounts, sessions, API keys){% endif %}, notes (example).
 -->

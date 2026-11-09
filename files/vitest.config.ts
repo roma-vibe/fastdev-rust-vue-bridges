@@ -1,8 +1,12 @@
 import { defineConfig } from 'vitest/config';
 
-// Web tests; Rust tests run with `cargo test --workspace` (both: `npm test`).
+// Web tests and the tests of the project scripts; Rust tests run with `cargo test --workspace`
+// (all of them: `npm test`).
 export default defineConfig({
   test: {
-    projects: ['web'],
+    projects: [
+      'web',
+      { test: { name: 'scripts', include: ['scripts/**/*.test.ts'], environment: 'node' } },
+    ],
   },
 });

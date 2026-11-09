@@ -1,0 +1,23 @@
+[package]
+name = "app-all"
+description = "Every service of services.json in one process, connected by in-process bridges"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+app-core.workspace = true
+app-edge.workspace = true
+app-notes.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

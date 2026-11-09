@@ -1,7 +1,8 @@
 //! The service registry (`/services.json`), embedded at compile time.
 //!
-//! Adding a microservice: add an entry to `services.json` (name, package, port env var, default
-//! port, edge routes), create `services/<name>` and call [`crate::service::run`] with that name.
+//! Adding a service: add an entry to `services.json` (name, package, port env var, default port,
+//! edge routes), create `services/<name>` (a library with `build(ctx)`, its `main.rs` calls
+//! [`crate::service::main`] with that name) and link it into `app/src/main.rs`.
 
 use std::sync::OnceLock;
 
@@ -11,7 +12,8 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceInfo {
-    /// Short name, e.g. `"notes"`; also the argument of [`crate::service::run`].
+    /// Short name, e.g. `"notes"`; also the argument of [`crate::service::main`] and of
+    /// [`Ctx::call`](crate::Ctx::call).
     pub name: String,
     /// Cargo package (and binary) name, e.g. `"app-notes"`.
     pub package: String,

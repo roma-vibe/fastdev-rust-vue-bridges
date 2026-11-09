@@ -1,0 +1,59 @@
+//! `app-all` — every service of `services.json` in one process (`docs/bridges.md`).
+//!
+//! The services are the same crates that also build as separate binaries; here they share one
+//! runtime, one database pool and one HTTP client, and call each other through in-process bridges.
+//! Only the edge listens. `BRIDGES=off` and `SEPARATE_SERVICES` move services back into processes
+//! of their own without changing any code.
+//!
+//! `app-all --plan` prints the binaries to run for the current configuration, one per line (the
+//! Docker entrypoint uses it), and exits.
+
+use app_core::{
+    Config, registry,
+    service::{self, Build},
+};
+
+/// In the order of `services.json`.
+const SERVICES: &[(&str, Build)] = &[
+    ("edge", |ctx| Box::pin(app_edge::build(ctx))),
+    ("identity", |ctx| Box::pin(app_identity::build(ctx))),
+    ("notes", |ctx| Box::pin(app_notes::build(ctx))),
+];
+
+/// The package of this binary, as the plan names it.
+const PACKAGE: &str = env!("CARGO_PKG_NAME");
+
+fn main() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    if std::env::args().nth(1).as_deref() == Some("--plan") {
+        for binary in plan(&config) {
+            println!("{binary}");
+        }
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.worker_threads())
+        .enable_all()
+        .build()?
+        .block_on(service::host(config, SERVICES))
+}
+
+/// The binaries (packages) to run: this one unless every service runs separately, then one per
+/// separate service. `scripts/lib/topology.ts` applies the same rule.
+fn plan(config: &Config) -> Vec<&str> {
+    let separate = config.separate_services();
+    let mut binaries = Vec::new();
+    if separate.len() < SERVICES.len() {
+        binaries.push(PACKAGE);
+    }
+    binaries.extend(
+        registry::services()
+            .iter()
+            .filter(|s| separate.contains(&s.name.as_str()))
+            .map(|s| s.package.as_str()),
+    );
+    binaries
+}
+
+#[cfg(test)]
+mod tests;

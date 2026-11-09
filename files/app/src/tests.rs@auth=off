@@ -1,0 +1,272 @@
+//! The whole app through its one public door: requests enter the edge and reach the services over
+//! the bridges, as in the real process, and over real sockets when services run separately. A
+//! service that breaks a rule of `docs/bridges.md` fails here in one of the modes.
+
+use std::{collections::HashMap, convert::Infallible, path::PathBuf, time::Duration};
+
+use app_core::{
+    Config, Ctx, crypto, db, registry,
+    service::{self, Build},
+};
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+    routing::get,
+};
+use futures::StreamExt as _;
+use serde_json::{Value, json};
+use tower::ServiceExt as _;
+
+use super::{PACKAGE, SERVICES, plan};
+
+async fn app() -> Router {
+    let ctx = Ctx::for_tests("app").await.unwrap();
+    let mut routers = service::assemble(&ctx, SERVICES).await.unwrap();
+    routers.remove("edge").unwrap()
+}
+
+/// The app with `separate` services out of it, each on a socket of its own as `SEPARATE_SERVICES`
+/// and `BRIDGES=off` run them. The edge stays inside: it is where the requests of the test enter.
+async fn app_without(separate: &[&str]) -> Router {
+    let mut vars = HashMap::from([("MASTER_KEY".to_owned(), crypto::generate_master_key())]);
+    let mut listeners = HashMap::new();
+    for name in separate {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        vars.insert(
+            format!("{}_URL", name.to_uppercase()),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        listeners.insert(*name, listener);
+    }
+    let config = Config::from_vars(std::env::temp_dir(), vars).unwrap();
+    let db = db::connect_memory().await.unwrap();
+
+    let (outside, inside): (Vec<_>, Vec<_>) = SERVICES
+        .iter()
+        .copied()
+        .partition(|(name, _)| separate.contains(name));
+    for (name, build) in outside {
+        // Its own context, so it reaches the other services the way a separate process does.
+        let ctx = Ctx::with_db(name, config.clone(), db.clone()).unwrap();
+        let mut routers = service::assemble(&ctx, &[(name, build)]).await.unwrap();
+        let router = routers.remove(name).unwrap();
+        let listener = listeners.remove(name).unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+    }
+    let ctx = Ctx::with_db("app", config, db).unwrap();
+    let mut routers = service::assemble(&ctx, &inside).await.unwrap();
+    routers.remove("edge").unwrap()
+}
+
+/// A client of the edge that keeps the session cookie like a browser.
+struct Client {
+    app: Router,
+    cookie: Option<String>,
+}
+
+impl Client {
+    fn new(app: &Router) -> Self {
+        Self {
+            app: app.clone(),
+            cookie: None,
+        }
+    }
+
+    async fn send(
+        &mut self,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path);
+        if let Some(cookie) = &self.cookie {
+            req = req.header(header::COOKIE, cookie);
+        }
+        if let Some(token) = bearer {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let req = match body {
+            Some(body) => req
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => req.body(Body::empty()),
+        };
+        let response = self.app.clone().oneshot(req.unwrap()).await.unwrap();
+        if let Some(set) = response.headers().get(header::SET_COOKIE) {
+            let pair = set.to_str().unwrap().split(';').next().unwrap().to_owned();
+            self.cookie = (!pair.ends_with('=')).then_some(pair);
+        }
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+}
+
+/// Every service answers `/health` and says which of them are out of the process.
+async fn check_health(app: &Router, separate: &[&str]) {
+    let (status, health) = Client::new(app)
+        .send("GET", "/api/health", None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["status"], "ok", "{health}");
+    let services = health["services"].as_array().unwrap();
+    assert_eq!(services.len(), registry::services().len() - 1);
+    for service in services {
+        let name = service["name"].as_str().unwrap();
+        assert_eq!(service["ok"], true, "{service}");
+        assert_eq!(service["version"], env!("CARGO_PKG_VERSION"), "{service}");
+        assert_eq!(service["bridged"], !separate.contains(&name), "{service}");
+    }
+}
+
+/// What a user does with the services through the edge: notes (the app has one local user, so
+/// nothing signs in), errors, and a path nobody serves.
+async fn check_journey(app: &Router) {
+    let mut client = Client::new(app);
+    let (status, note) = client
+        .send(
+            "POST",
+            "/api/notes",
+            None,
+            Some(json!({"title": "Hello", "body": "over the bridge"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{note}");
+    let id = note["id"].as_str().unwrap();
+    let (status, note) = client
+        .send(
+            "PATCH",
+            &format!("/api/notes/{id}?x=1"),
+            None,
+            Some(json!({"pinned": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{note}");
+    assert_eq!(note["pinned"], true);
+    let (status, list) = client.send("GET", "/api/notes", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+
+    let (status, error) = client
+        .send("POST", "/api/notes", None, Some(json!({"title": ""})))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["code"], "bad_request");
+    let (status, _) = client.send("GET", "/api/nothing", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The same journey wherever the services run.
+async fn check_everything(app: &Router, separate: &[&str]) {
+    check_health(app, separate).await;
+    check_journey(app).await;
+}
+
+#[test]
+fn every_registered_service_is_linked() {
+    let linked: Vec<&str> = SERVICES.iter().map(|(name, _)| *name).collect();
+    let registered: Vec<&str> = registry::services()
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(
+        linked, registered,
+        "keep SERVICES in step with services.json"
+    );
+}
+
+#[tokio::test]
+async fn all_services_in_one_process() {
+    check_everything(&app().await, &[]).await;
+}
+
+#[tokio::test]
+async fn some_services_in_processes_of_their_own() {
+    let separate = ["notes"];
+    check_everything(&app_without(&separate).await, &separate).await;
+}
+
+/// What `BRIDGES=off` runs: nothing is reached without a socket.
+#[tokio::test]
+async fn every_service_in_a_process_of_its_own() {
+    let separate: Vec<&str> = SERVICES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| *name != "edge")
+        .collect();
+    check_everything(&app_without(&separate).await, &separate).await;
+}
+
+/// A notes service whose answer never ends: all it ever sends is the first chunk.
+fn endless_notes() -> Router {
+    async fn endless() -> Body {
+        let first = futures::stream::once(async { Ok::<_, Infallible>("first") });
+        Body::from_stream(first.chain(futures::stream::pending()))
+    }
+    Router::new().route("/api/notes/endless", get(endless))
+}
+
+/// Streamed answers pass the edge chunk by chunk: the first one is here while the service is not
+/// done.
+async fn check_stream(edge: Router) {
+    let req = Request::get("/api/notes/endless")
+        .body(Body::empty())
+        .unwrap();
+    let response = edge.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("the first chunk must not wait for the end of the stream");
+    assert_eq!(first.unwrap().unwrap(), "first");
+}
+
+#[tokio::test]
+async fn a_stream_passes_the_edge_and_the_bridge_while_it_runs() {
+    const SERVICES: &[(&str, Build)] = &[
+        ("edge", |ctx| Box::pin(app_edge::build(ctx))),
+        ("notes", |_| Box::pin(async { Ok(endless_notes()) })),
+    ];
+    let ctx = Ctx::for_tests("app").await.unwrap();
+    let mut routers = service::assemble(&ctx, SERVICES).await.unwrap();
+    check_stream(routers.remove("edge").unwrap()).await;
+}
+
+#[tokio::test]
+async fn a_stream_passes_the_edge_and_a_socket_while_it_runs() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, endless_notes()).await });
+    let ctx = Ctx::for_tests_with("edge", &[("NOTES_URL", &url)])
+        .await
+        .unwrap();
+    check_stream(app_edge::build(ctx).await.unwrap()).await;
+}
+
+#[test]
+fn the_plan_follows_the_bridge_settings() {
+    let plan_of = |pairs: &[(&str, &str)]| {
+        let mut vars = HashMap::from([("MASTER_KEY".to_owned(), "x".to_owned())]);
+        for (key, value) in pairs {
+            vars.insert((*key).to_owned(), (*value).to_owned());
+        }
+        let config = Config::from_vars(PathBuf::from("/"), vars).unwrap();
+        plan(&config)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(plan_of(&[]), [PACKAGE]);
+    assert_eq!(
+        plan_of(&[("SEPARATE_SERVICES", "notes")]),
+        [PACKAGE, "app-notes"]
+    );
+    let every: Vec<String> = registry::services()
+        .iter()
+        .map(|s| s.package.clone())
+        .collect();
+    assert_eq!(plan_of(&[("BRIDGES", "off")]), every);
+}

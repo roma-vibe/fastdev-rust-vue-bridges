@@ -1,0 +1,87 @@
+# Bridges: one process or microservices
+
+The same services run as one small process or as separate microservices. It is a setting, not a rewrite: no service knows which way it runs, and you can switch in both directions at any time.
+
+## How it works
+
+- **Every service is a library.** `services/<name>/src/lib.rs` has `build(ctx)`: its routes and the background work it starts with `tokio::spawn`. Two binaries use it: `services/<name>/src/main.rs` runs that one service (`app_core::service::main("<name>", app_<name>::build)`), `app/src/main.rs` (`app-all`) runs all of them.
+- **Services talk through bridges only.** `ctx.call("notes", request)` (`crates/core/src/bridge.rs`) sends a request to another service. When this process hosts that service, the request goes straight into its router: no socket, no extra memory. Otherwise it goes over HTTP to `Config::service_url` (`<NAME>_URL`, else `BIND_HOST:<NAME>_PORT`). Both ways stream the bodies, and the other side sees the same method, path, query, headers and body. Today the edge is the only caller: it forwards every `/api/*` request and asks every service for its `/health` through `ctx.call`.
+- **`app-all` shares everything it can:** one Tokio runtime with up to 4 workers (`WORKER_THREADS`), one SQLite pool, one HTTP client, migrations applied once. Only the edge opens a port, and `scripts/start.ts` hands over to the binary (`execve`), so no Node stays in memory. In Docker the entrypoint `exec`s it, so it is PID 1.
+
+`service::host` is the bootstrap of the shared process, `service::main` / `service::run` of a separate one, and `service::assemble` builds services and connects their bridges (the tests use it too). `GET /api/health` tells for each service whether it is `bridged`, that is, in the process of the edge.
+
+## Switching
+
+Set it in `.env` (or the environment) and restart. `npm run dev`, `npm start` and Docker follow the same rule: `scripts/lib/topology.ts` on the Node side, `Config::separate_services` on the Rust side, and `app-all --plan` (which prints the binaries to run) in `docker/entrypoint.sh`.
+
+| Setting | Processes | Ports |
+| --- | --- | --- |
+| `BRIDGES=on` (default) | `app-all` | the edge only |
+| `SEPARATE_SERVICES=notes` | `app-all`, `app-notes` and the runner that supervises them | every service on its own: the separate ones need to reach the others |
+| `BRIDGES=off` | `app-edge`, `app-identity`, `app-notes` and the runner | every service on its own |
+
+The database, the API and the URLs stay the same, so nothing else changes when you switch. To put a service on another host, set `<NAME>_URL` (for example `NOTES_URL=http://10.0.0.5:8702`) and run its binary there. `npm run dev -- --only notes,edge` still runs the named services as separate processes. `npm run dev` reads the setting at start: after changing `BRIDGES` or `SEPARATE_SERVICES` in `.env` restart it (it says so).
+
+## What it saves
+
+Measured on Linux (a cloud container: Ubuntu 24.04, glibc 2.39, 4 vCPU), release build, a fresh database each run, `node scripts/start.ts`. Every number is the sum over all processes of the app, the Node runner included: RSS, and in brackets PSS (shared pages divided between the processes; the closest Linux counterpart of the macOS physical footprint). "After traffic" follows 4 registrations, 4 logins (8 argon2 hashes), 1200 requests over every service (health, auth config, `/api/me`, keys, notes list and create, the web app, an unknown path) with 8 in parallel, and 4 key creations. The memory did not change 15 s and 75 s later in any run, so those columns are left out.
+
+| Linux, `node scripts/start.ts` | Idle (20 s) | After traffic | Processes / threads |
+| --- | --- | --- | --- |
+| Before (3 services + Node runner) | 91.0 MB (61.7) | 113.0 MB (83.7) | 4 / 25 |
+| Before, with the `MALLOC_*` settings | 88.3 MB (59.0) | 90.9 MB (61.6) | 4 / 25 |
+| `BRIDGES=on` | **11.2 MB (9.3)** | **13.3 MB (11.4)** | 1 / 6 |
+| `SEPARATE_SERVICES=notes` | 82.9 MB (55.8) | 85.3 MB (58.2) | 3 / 19 |
+| `BRIDGES=off` | 92.3 MB (63.0) | 95.1 MB (65.8) | 4 / 25 |
+
+So bridges on take about **8× less** than before (91 → 11 MB idle, 113 → 13 MB after traffic), and still about 7× less when the old layout gets the same malloc settings.
+
+In Docker (Linux, glibc 2.36 of `debian:bookworm-slim`): the sum of RSS over the processes of the container, and in brackets the memory of the container from `docker stats`. `docker stats` leaves out the page cache, and the code of the binaries is page cache, so it is the smaller number.
+
+| Docker | Idle (20 s) | After traffic | Processes |
+| --- | --- | --- | --- |
+| Before (entrypoint + 3 services) | 30.8 MB (4.7 MiB) | 167.3 MB (142.3 MiB) | 5 |
+| Before, with the `MALLOC_*` settings | 30.8 MB (4.7 MiB) | 33.8 MB (8.5 MiB) | 5 |
+| `BRIDGES=on` | **10.4 MB (2.1 MiB)** | **12.9 MB (5.3 MiB)** | 1 |
+| `BRIDGES=on` without the `MALLOC_*` settings | 10.5 MB (2.1 MiB) | 146.1 MB (139.1 MiB) | 1 |
+| `SEPARATE_SERVICES=notes` | 22.7 MB (3.7 MiB) | 25.3 MB (6.9 MiB) | 4 |
+| `BRIDGES=off` | 31.5 MB (4.4 MiB) | 34.2 MB (8.2 MiB) | 5 |
+
+Idle the container takes 3× less (there was no Node in it before either), after traffic 13× less than before (2.6× less than the old layout with the same malloc settings).
+
+**The `MALLOC_*` settings** (`MALLOC_ARENA_MAX=2`, `MALLOC_MMAP_THRESHOLD_=1048576`, `MALLOC_TRIM_THRESHOLD_=1048576`) are in the Dockerfile, and `scripts/start.ts` / `scripts/dev.ts` pass them to the Rust processes (`scripts/lib/project.ts`; a value in `.env` or the environment wins). Without them glibc keeps what it freed: argon2 takes 19 MB per hash, and the dynamic mmap threshold of glibc moves such blocks onto the heap after the first one is freed, where they stay. That alone took `app-all` from 13 MB to 146 MB in Docker. `MALLOC_MMAP_THRESHOLD_` does most of it (13.7 MB with it alone on Linux, 31.7 MB with `MALLOC_ARENA_MAX` alone). glibc reads them from the real environment, so running a binary by hand without them gives the bigger numbers.
+
+Tried and left out: `WORKER_THREADS=1` or `2` (less than 0.5 MB difference), fat LTO with one codegen unit (−1 MB, 10.2 instead of 11.2 MB idle, for a noticeably longer release build of every binary). What is left of `app-all` idle is mostly its own code: of 11 MB RSS, 8 MB are clean pages of the binary and about 1 MB is anonymous memory.
+
+`npm start` keeps npm itself in memory above the app (73 MB idle instead of 11 MB). For the smallest process run `node scripts/start.ts` or the binary directly (with the `MALLOC_*` settings), as Docker does.
+
+What was not measured: macOS (and its `footprint`), `npm run dev` (Node and Vite dominate there whatever the services do), long-running load and memory growth over hours, a browser session. Each configuration ran once; two runs of the baseline differed by less than 1%. The Docker images were the runtime stage of the `Dockerfile` without `apt-get install ca-certificates` (the sandbox could not reach the Debian mirrors; no service makes outbound TLS calls) over binaries built in `rust:1-bookworm`, so the full `docker compose build` was not run there.
+
+## What you give up in one process
+
+- **A crash takes everything down.** A panic in a request stays contained, as in a separate service (the bridge catches it and the caller gets 503), but an abort, running out of memory or a stack overflow ends the whole process. Docker restarts it (`restart: unless-stopped`); a bare `node scripts/start.ts` does not. The runner restarts crashed processes only when there are several.
+- **One restart, one scale.** You cannot restart, deploy or scale a single service alone. When you need that for one of them, use `SEPARATE_SERVICES`.
+- **A shared runtime.** A service that blocks a worker slows the others, so CPU work belongs on blocking threads (`spawn_blocking`), as password hashing does (`services/identity/src/password.rs`).
+- **One log.** All services write into one output. Lines carry the module (`app_identity::…`), and the request spans (`LOG_LEVEL=debug`) name the service; a bridged call is a span inside the edge's.
+
+## Rules that keep the switch working
+
+- Services never import each other: only `app/` links them. Shared code goes to `crates/`.
+- Calls between services go through `ctx.call`, never through `reqwest` and `service_url` directly. `ctx.http` is for external APIs only.
+- A request carries only what HTTP would: extensions such as `ConnectInfo` do not exist inside a bridge, so pass what a service needs in headers (the edge sets `x-forwarded-host` and `x-forwarded-proto`).
+- No state shared in memory between services: what they share lives in the database or travels through `ctx.call`. Statics must not assume one service per process (`registry` and the migrator are read-only, which is fine).
+- Background work starts in `build` with `tokio::spawn`, not in `main`. `main.rs` stays one call.
+- The database is opened by the bootstrap only (`Ctx::new`): one pool of up to 8 SQLite connections in `app-all`, one per process otherwise, migrations under a file lock. A service never opens its own pool or runs its own migrations.
+
+`app/src/tests.rs` runs the same user journey (health with `bridged`, registration and the session cookie, `/api/me`, an API key, notes over that key, the admin list, errors, logout) in all three modes, over bridges and over real sockets, plus a stream through the edge both ways, and checks that `SERVICES` in `app/src/main.rs` matches `services.json`. A service that breaks one of these rules fails there. When you add a service, add it to `SERVICES`, to the workspace dependencies in `Cargo.toml` and to `app/Cargo.toml`.
+
+---
+
+## Кратко по-русски
+
+- По умолчанию все сервисы работают одним процессом `app-all` и вызывают друг друга напрямую через мосты (`ctx.call`): без сокетов и без лишней памяти. Порт открывает только edge.
+- `BRIDGES=off` в `.env` возвращает отдельные микросервисы с HTTP между ними, `SEPARATE_SERVICES=notes` выносит в отдельные процессы только нужные сервисы. Код менять не надо, достаточно перезапуска; это работает в `npm run dev`, `npm start` и Docker.
+- Память (Linux, сумма по процессам): было 91 МБ в покое и 113 МБ после нагрузки, стало 11 и 13 МБ, примерно в 8 раз меньше. В Docker было 31 и 167 МБ, стало 10 и 13 МБ.
+- Настройки `MALLOC_*` обязательны: без них glibc держит память после хеширования паролей, и процесс вырастает с 13 до 146 МБ.
+- Цена одного процесса: аварийное завершение (нехватка памяти, переполнение стека) роняет всё приложение, а отдельный сервис нельзя перезапустить или масштабировать, не вынося его в свой процесс.
+- Меньше всего памяти занимает `node scripts/start.ts` или сам бинарник: `npm start` держит в памяти ещё и npm.

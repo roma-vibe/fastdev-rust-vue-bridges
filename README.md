@@ -1,8 +1,8 @@
-# Rust + Vue microservices
+# Rust + Vue bridges
 
-A web app built from Rust microservices (axum, SQLite) behind an edge proxy, with a modular Vue 3 single-page app in a liquid glass design.
+Rust services that run as one process by default (in-process bridges) and can be split back into microservices without code changes, with a modular Vue 3 SPA.
 
-This repository is a [fastDev](https://github.com/roma-vibe/fastDev) project skeleton (`rust-vue-microservices`). fastDev lists it
+This repository is a [fastDev](https://github.com/roma-vibe/fastDev) project skeleton (`rust-vue-bridges`). fastDev lists it
 from a registry, downloads it when first used and creates named, ready-to-run projects from it.
 
 - `template.toml` — the manifest: requirements, options, env, setup steps and commands.
