@@ -1,10 +1,18 @@
 //! Reverse proxy: forwards a request to the service that owns its path, through the bridges
-//! (`Ctx::call`): into its router when this process hosts it, else over HTTP.
+//! (`Ctx::call`): into its router when this process hosts it, else over HTTP. It passes the client
+//! address to the service in `x-client-ip` (`app_core::client_ip`), replacing any copy the client
+//! sent.
 
-use app_core::{ApiError, Ctx, registry};
+use std::net::SocketAddr;
+
+use app_core::{
+    ApiError, Ctx,
+    client_ip::{self, CLIENT_IP_HEADER},
+    registry,
+};
 use axum::{
-    extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Uri, header},
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Uri, header, request::Parts},
     response::{IntoResponse, Response},
 };
 
@@ -24,7 +32,10 @@ const HOP_BY_HOP: [&str; 8] = [
 
 fn copy_headers(from: &HeaderMap, to: &mut HeaderMap) {
     for (name, value) in from {
-        if HOP_BY_HOP.contains(&name.as_str()) || name == header::HOST {
+        if HOP_BY_HOP.contains(&name.as_str())
+            || name == header::HOST
+            || name.as_str() == CLIENT_IP_HEADER
+        {
             continue;
         }
         to.append(name.clone(), value.clone());
@@ -54,6 +65,9 @@ async fn forward(ctx: &Ctx, service: &str, req: Request) -> Response {
         HeaderName::from_static("x-forwarded-proto"),
         HeaderValue::from_static("http"),
     );
+    if let Some(ip) = client_address(ctx, &parts) {
+        headers.insert(HeaderName::from_static(CLIENT_IP_HEADER), ip);
+    }
     let mut inner = Request::new(body);
     *inner.method_mut() = parts.method;
     *inner.uri_mut() = parts
@@ -75,4 +89,20 @@ async fn forward(ctx: &Ctx, service: &str, req: Request) -> Response {
     *response.status_mut() = parts.status;
     copy_headers(&parts.headers, response.headers_mut());
     response
+}
+
+/// The client: the TCP peer, or the right-most `X-Forwarded-For` entry with `TRUST_PROXY=on`.
+fn client_address(ctx: &Ctx, parts: &Parts) -> Option<HeaderValue> {
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
+    let forwarded = parts
+        .headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .next_back();
+    let ip = client_ip::resolve(peer, forwarded, ctx.config.trust_proxy)?;
+    HeaderValue::from_str(&ip.to_string()).ok()
 }

@@ -9,7 +9,7 @@ Then read `docs/architecture.md` (services, ownership, rules), `docs/bridges.md`
 
 ## Stack
 
-- **Backend:** Rust 2024 workspace (Rust 1.89+). Services on **axum 0.8** + **tokio**: every service in `services/` is a library with `build(ctx)` and a one-line binary; `app/` (`app-all`) links them all into one process connected by in-process bridges (the default), `BRIDGES=off` runs them as separate microservices (`docs/bridges.md`). Shared code in `crates/`. **SQLite** through **sqlx 0.8** (runtime queries with `?` parameters, no compile-time query macros), migrations embedded in every service. reqwest (rustls) behind the bridges and for external APIs, argon2 for passwords, AES-GCM for secrets at rest.
+- **Backend:** Rust 2024 workspace (Rust 1.94+). Services on **axum 0.8** + **tokio**: every service in `services/` is a library with `build(ctx)` and a one-line binary; `app/` (`app-all`) links them all into one process connected by in-process bridges (the default), `BRIDGES=off` runs them as separate microservices (`docs/bridges.md`). Shared code in `crates/`. **SQLite** through **sqlx 0.9** (runtime queries with `?` parameters and static SQL strings — sqlx refuses SQL built at runtime; no compile-time query macros), migrations embedded in every service. reqwest (rustls) behind the bridges and for external APIs, argon2 for passwords, AES-GCM for secrets at rest.
 - **Web:** **Vue 3** (`<script setup lang="ts">`), **Vite**, **Vue Router**, **Pinia**, **vue-i18n** (English and Russian), **Tailwind CSS 4** (liquid glass design, orange `accent-*` tokens, light/dark/system themes), lucide icons.
 - **Tooling:** npm workspace `web`, TypeScript strict, ESLint, Prettier, Vitest; cargo clippy (`-D warnings`), rustfmt, `cargo test` (`wiremock` for HTTP).
 
@@ -19,18 +19,19 @@ Then read `docs/architecture.md` (services, ownership, rules), `docs/bridges.md`
 .env / .env.example     the single configuration (APP_NAME, ports, DB_PATH, MASTER_KEY, …)
 services.json           service registry: names, packages, port keys, URL prefixes routed by the edge
 Cargo.toml              workspace: members crates/* and services/*, shared dependency versions
-crates/core/            app-core: config, registry, db + migrations, ApiError, Caller{% if features.auth %}, auth{% endif %}, crypto, settings, bridges (Ctx::call), service::main/host
+crates/core/            app-core: config, registry, db + migrations, ApiError, Caller{% if features.auth %}, auth (+ origin check){% endif %}, crypto, settings, bridges (Ctx::call), outbound (SSRF-safe client), client_ip, service::main/host
 app/                    app-all: every service in one process (the default); tests of the whole app in all three modes
-services/edge/          public entry: forwards /api/* by services.json through the bridges, serves web/dist, /api/health
+services/edge/          public entry: forwards /api/* by services.json through the bridges, serves web/dist, /api/health, security headers (headers.rs)
 {%- if features.auth %}
-services/identity/      accounts: register/login/logout, /api/me, personal API keys, admin user list
+services/identity/      accounts: register/login/logout (throttle.rs), /api/me, personal API keys, admin user list
 {%- endif %}
 services/notes/         example service: lib.rs (build) → routes.rs → model.rs (validation) → store.rs (SQL); tests.rs; main.rs runs it alone
 migrations/             SQL migrations, one block of numbers per owner service
 web/src/app/            shell: router, layouts, sidebar, theme/locale switches, toasts
 web/src/shared/         http client, i18n, theme, toasts, format helpers, UI kit{% if features.auth %}, auth store{% endif %}
 web/src/features/       one module per feature: home, notes{% if features.auth %}, auth, profile, keys{% endif %}
-scripts/                setup.ts (.env), dev.ts (services + Vite), start.ts (release builds), lib/topology.ts (which processes run)
+scripts/                setup.ts (.env), dev.ts (services + Vite), start.ts (release builds), security.ts (secbase check), lib/topology.ts (which processes run)
+secbase.json            security gate config: profile web-public, ignored paths, allowed findings with reasons
 docs/                   architecture.md, bridges.md, api.md, frontend.md
 {%- if choices.docker == "run" %}
 Dockerfile, docker-compose.yml, docker/   production image: app-all, every service binary and the web app
@@ -40,13 +41,29 @@ Dockerfile, docker-compose.yml, docker/   production image: app-all, every servi
 ## Architecture rules
 
 - **Request path:** browser → (Vite in dev) → **edge** → the service that owns the URL prefix (`services.json`, longest prefix wins). Services never call the browser-facing edge; they call each other with `ctx.call("<name>", request)`, which stays in the process when both run in `app-all` and goes over HTTP otherwise. Never `reqwest` + `service_url` for another service.
-- **Bridges** (`docs/bridges.md`): a service is a library whose `build(ctx)` returns its router and starts its background work (`tokio::spawn`); `main.rs` stays one call. Services never import each other (only `app/` links them), share nothing in memory (the database or `ctx.call`), get only headers from a request (no `ConnectInfo` or other extensions), never open their own database, and run CPU work on `spawn_blocking`.
+- **Bridges** (`docs/bridges.md`): a service is a library whose `build(ctx)` returns its router and starts its background work (`tokio::spawn`); `main.rs` stays one call. Services never import each other (only `app/` links them), share nothing in memory (the database or `ctx.call`), get only headers from a request (no `ConnectInfo` or other extensions; the edge passes the client address as `x-client-ip`), never open their own database, and run CPU work on `spawn_blocking`.
 - **Layers of a service:** `routes.rs` (extract the caller, parse, call logic, map to JSON) → logic/validation module (`model.rs`) → `store.rs` (SQL only) → SQLite. No SQL in handlers, no HTTP types in the store.
 - **Ownership:** only the owner service writes a table (named in a `-- [owner]` comment in its migration). Others may read it.
-- **Errors:** handlers return `ApiResult<Json<T>>`; errors are `ApiError` (`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `unavailable`, `internal`) and reach the client as `{"error": {"code", "message"}}`. Database errors convert automatically.
+- **Errors:** handlers return `ApiResult<Json<T>>`; errors are `ApiError` (`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `too_many_requests`, `unavailable`, `internal`) and reach the client as `{"error": {"code", "message"}}`. Database errors convert automatically; internal errors are logged and reach the client only as `Internal server error`.
 - **Users:** per-user data is scoped by `app_core::Caller` (`caller.user_id`) in every query.{% if features.auth %} Use `AuthUser` when the handler needs the user's details and `AdminUser` for admin-only routes.{% else %} There is no sign-in yet: every request is the local user `local`; adding accounts only changes `crates/core/src/caller.rs`.{% endif %}
 - **Responses:** camelCase JSON (`#[serde(rename_all = "camelCase")]`), times as Unix ms (`app_core::now_ms()`), ids from `app_core::new_id()` (UUID v7), lists as `{"items": [...]}`.
 - **Web:** page → feature store (Pinia) → feature `api.ts` → `@/shared/api/http.ts` (the only `fetch`). A feature imports only `@/shared/**` and its own files.
+
+## Security
+
+The defaults protect a public web app. Never weaken them to make something work: fix the cause, or ask the owner{% if options.spec_md %} and record the exception in `SPEC.md`{% endif %}.
+
+- **Headers** (`services/edge/src/headers.rs`, every response): `nosniff`, `Referrer-Policy`, `X-Frame-Options: DENY`, COOP, `Permissions-Policy`, HSTS when `PUBLIC_URL` is https, a strict CSP for the built app (no inline scripts or styles; `data:` only for images and fonts) and `default-src 'none'` for everything else, `Cache-Control: no-store` with credentials. A new external host for scripts, styles, fonts or `fetch` needs a CSP change with its reason.
+{%- if features.auth %}
+- **Sessions** (`crates/core/src/auth/`): HttpOnly, SameSite=Lax cookie (`__Host-` and `Secure` behind https), a new token per sign-in, deleted at sign-out; a password change signs out the other sessions. Cookie-signed `POST`/`PUT`/`PATCH`/`DELETE` need an allowed `Origin` (`auth/origin.rs`: `PUBLIC_URL`, Vite in development, `ALLOWED_ORIGINS`), else 403; API-key requests are exempt.
+- **Sign-in throttling** (`services/identity/src/throttle.rs`): per email and per client, 5 free failures in 15 minutes, then waits from 1 s doubling to 15 minutes; per client 30 sign-ins per 10 minutes and 10 registrations per hour; 429 with `Retry-After`, the same for unknown emails, never a lockout.
+{%- endif %}
+- **Host check** (`services/edge/src/host.rs`, every request): the edge answers only for `localhost`, `127.0.0.1`, `[::1]` and the hosts of the allowed origins (`PUBLIC_URL`, Vite, `ALLOWED_ORIGINS`), else 421, so DNS rebinding cannot reach the loopback API. A published app's hostname goes into `PUBLIC_URL`.
+- **Client address:** only the edge sets `x-client-ip` (`app_core::client_ip`, `TRUST_PROXY`); use it for limits and logs, never for access decisions.
+- **Data:** every query of per-user data is scoped by the owner (`WHERE id = ? AND owner_id = ?`){% if features.auth %} and has a two-user test: user B gets 404 on A's rows and never sees them in lists{% endif %}. Bodies over `MAX_BODY_BYTES` (1 MiB) get 413.
+- **Outbound HTTP:** every URL from a user, a model, a webhook setting or a third party goes through `ctx.outbound` (`app_core::outbound`: public addresses only, ports 80/443, redirects re-checked, 10 s, 5 MB). Other services: `ctx.call`. `ctx.http` (plain reqwest) only for fixed, trusted API hosts written in the code.
+- **Before touching** authentication, access control, input handling, outbound requests, uploads or LLM features, read `secbase checklist <area>` (`secbase checklist` lists the areas).
+- `npm run check` ends with `npm run security` (`secbase check`, profile in `secbase.json`); an exception goes into its `allow` list with a reason.
 
 ## Commands
 
@@ -56,7 +73,8 @@ Dockerfile, docker-compose.yml, docker/   production image: app-all, every servi
 | `npm run build` | Type-checks, builds `web/dist` and release binaries (`app-all` and every service) |
 | `npm start` | Runs the release builds (by default turns into `app-all`); the edge serves the app and the API on http://localhost:{{ ports.EDGE_PORT }}. `node scripts/start.ts` keeps npm out of memory; `-- --check` prints the plan |
 | `npm test` | Vitest (web and scripts) + `cargo test --workspace` |
-| `npm run check` | The quality gate: ESLint + clippy, Prettier + rustfmt, vue-tsc, all tests |
+| `npm run check` | The quality gate: ESLint + clippy, Prettier + rustfmt, vue-tsc, all tests, `npm run security` |
+| `npm run security` | `secbase check` (`secbase.json`); without secbase it fails, in CI too (install: `npm link` in `~/Documents/secbase`); only `SECBASE_OPTIONAL=1` skips it with a notice, never set it to get a green check |
 | `npm run lint` / `npm run format` | Lint only / format everything (Prettier + `cargo fmt`) |
 | `cargo test -p app-<name>` | Tests of one crate or service; `cargo test -p app-all`: the whole app in all three modes |
 | `npm run setup` | Creates `.env` from `.env.example` with a fresh `MASTER_KEY` (`-- --port-base 9000` shifts every port) |
@@ -71,6 +89,7 @@ Dockerfile, docker-compose.yml, docker/   production image: app-all, every servi
 - Ports: `EDGE_PORT`, `WEB_PORT` and one `<NAME>_PORT` per service (`services.json` → `portEnv`). With bridges on only the edge port is open.
 - Processes: `BRIDGES` (`on` default, `off`), `SEPARATE_SERVICES` (e.g. `notes`), `WORKER_THREADS` (default up to 4), `<NAME>_URL` for a service on another host (`docs/bridges.md`). The runners and the Dockerfile set the glibc `MALLOC_*` settings.
 - `MASTER_KEY` encrypts secrets at rest (`ctx.crypto`). Never log it, never change it on a running installation.
+- Security: `PUBLIC_URL` (set it to the public address when published: its origin{% if features.auth %} may send cookie-signed writes{% else %} is the app's{% endif %}, https adds HSTS){% if features.auth %}, `ALLOWED_ORIGINS`{% endif %}, `TRUST_PROXY` (client address from `X-Forwarded-For`), `MAX_BODY_BYTES`, `APP_ENV` (default: production for release builds).
 - Add a key: `.env.example` (with a comment) → a field in `Config` or `ctx.config.var("KEY")` → this file / `README.md` when it matters to humans.
 
 ## How to
@@ -122,6 +141,8 @@ Handler in the service's `routes.rs` (or a new module), validation in `model.rs`
 - One production image serves the web app and the API through the edge on `EDGE_PORT`. `docker/entrypoint.sh` asks `app-all --plan` what to run: by default it `exec`s `app-all` (one process, PID 1); with `BRIDGES=off` / `SEPARATE_SERVICES` it runs the separate binaries and stops the container when one exits. The image sets `MALLOC_ARENA_MAX`, `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` (`docs/bridges.md`). Development happens on the host (`npm run dev`).
 - **Data:** `DOCKER_DATA` in `.env` decides where the container keeps the SQLite database (`/app/data`): {% if choices.data == "local" %}**`./data`** — the project's `data/` folder is mounted (current setting); set `DOCKER_DATA=data` to use a Docker volume instead.{% else %}**`data`** — the named volume `{{ project.slug }}_data` (current setting); `docker compose down -v` deletes it. Set `DOCKER_DATA=./data` to keep the files in the project's `data/` folder instead.{% endif %}
 - Commands: `docker compose up --build`, `docker compose logs -f`, `docker compose down` (add `-v` to delete the volume).
+- Compose publishes `EDGE_PORT` on the host's `127.0.0.1` only; reach it from outside through a tunnel or a reverse proxy, never by publishing on all interfaces.
+- **Security gate:** the image has no secbase and never runs the checks: in Docker mode you must still run `npm run check` (it ends with `npm run security`) on the host.
 {%- endif %}
 
 ---

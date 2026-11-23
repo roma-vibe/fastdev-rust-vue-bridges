@@ -1,5 +1,7 @@
 //! Password hashing with argon2id (on the blocking pool: hashing takes tens of milliseconds).
 
+use std::sync::OnceLock;
+
 use anyhow::anyhow;
 use app_core::ApiError;
 use argon2::{
@@ -37,6 +39,22 @@ pub async fn hash(password: &str) -> Result<String, ApiError> {
     .await
     .map_err(anyhow::Error::from)??;
     Ok(hashed)
+}
+
+/// Hash of a random password, verified for unknown emails so that a sign-in takes as long whether
+/// the account exists or not.
+static DECOY: OnceLock<String> = OnceLock::new();
+
+/// Spends the time of a real [`verify`] and never matches: for sign-ins with an unknown email.
+pub async fn verify_decoy(password: &str) {
+    let decoy = match DECOY.get() {
+        Some(hash) => hash.clone(),
+        None => match hash(&app_core::crypto::random_token("decoy-")).await {
+            Ok(hash) => DECOY.get_or_init(|| hash).clone(),
+            Err(_) => return,
+        },
+    };
+    let _ = verify(password, &decoy).await;
 }
 
 /// Whether `password` matches the PHC string `hash` (an empty or broken hash never matches).

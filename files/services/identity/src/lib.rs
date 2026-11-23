@@ -5,11 +5,13 @@
 mod account;
 mod admin;
 mod keys;
+mod limiter;
 mod me;
 mod password;
 mod routes;
 #[cfg(test)]
 mod tests;
+mod throttle;
 mod users;
 
 use app_core::Ctx;

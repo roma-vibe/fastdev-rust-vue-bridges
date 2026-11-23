@@ -23,6 +23,7 @@ pub async fn serve(ctx: &Ctx, req: Request) -> Response {
     let service = ServeDir::new(dist).fallback(ServeFile::new(index));
     match service.oneshot(req).await {
         Ok(resp) => resp.into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        // Missing files fall back to index.html, I/O errors become 500 inside ServeDir.
+        Err(never) => match never {},
     }
 }

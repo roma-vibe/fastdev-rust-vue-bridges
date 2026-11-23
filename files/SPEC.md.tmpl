@@ -64,7 +64,16 @@ Existing: edge (public entry, proxy + web app){% if features.auth %}, identity (
 
 ## Non-functional requirements
 
-<!-- Security (authentication, authorization, input validation, secrets), privacy, performance, accessibility, supported browsers, logging, backups of the SQLite database, deployment ({% if choices.docker != "none" %}Docker Compose: one container with every service{% else %}release binaries started by `npm start`{% endif %}). -->
+<!-- Privacy, performance, accessibility, supported browsers, logging, backups of the SQLite database, deployment ({% if choices.docker != "none" %}Docker Compose: one container with every service{% else %}release binaries started by `npm start`{% endif %}). -->
+
+### Security
+
+<!-- Complete with the owner. The defaults are listed in AGENTS.md, "Security"; weakening one needs an entry here with its reason. -->
+
+- **Profile:** `web-public` (`secbase.json`). <!-- `web-local` only if the app never leaves this machine. -->
+- **Auth model:** {% if features.auth %}accounts with email and password (the first user is the admin), cookie sessions in the browser, personal API keys for programs.{% else %}none yet: one local user. Add accounts before the app is published.{% endif %}
+- **Data ownership:** {% if features.auth %}a note belongs to its author (`owner_id`); only admins see and manage users.{% else %}all data belongs to the local user.{% endif %} _Add every new table: who owns its rows, who may read them._
+- **Public exposure:** _Where it runs (this Mac only, a tunnel URL, a domain), who can reach it and what anonymous visitors may do._
 
 ## Open questions
 

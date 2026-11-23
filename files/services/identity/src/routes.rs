@@ -1,13 +1,16 @@
 //! The routes of the identity service; handlers live in one module per resource.
 
+use std::sync::Arc;
+
 use app_core::Ctx;
 use axum::{
-    Router,
+    Extension, Router,
     routing::{delete, get, patch, post},
 };
 
-use crate::{account, admin, keys, me};
+use crate::{account, admin, keys, me, throttle::Throttle};
 
+/// The routes, with one sign-in [`Throttle`] shared by every request to them.
 pub fn router(ctx: Ctx) -> Router {
     Router::new()
         .route("/api/auth/config", get(account::config))
@@ -20,5 +23,6 @@ pub fn router(ctx: Ctx) -> Router {
         .route("/api/keys/{id}", delete(keys::revoke))
         .route("/api/admin/users", get(admin::list))
         .route("/api/admin/users/{id}", patch(admin::update))
+        .layer(Extension(Arc::new(Throttle::default())))
         .with_state(ctx)
 }

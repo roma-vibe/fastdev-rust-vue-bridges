@@ -1,5 +1,7 @@
 //! Route tests: other services are replaced by `wiremock` servers through `<NAME>_URL`.
 
+mod security;
+
 use app_core::{Ctx, registry};
 use axum::{
     Router,
@@ -20,10 +22,20 @@ async fn edge(mock: &MockServer, web_dist: &str) -> Router {
 
 /// An edge whose every service URL is `base_url`.
 async fn edge_at(base_url: &str, web_dist: &str) -> Router {
+    edge_with(base_url, web_dist, &[]).await
+}
+
+/// Like [`edge_at`], with more config values (`PUBLIC_URL`, `TRUST_PROXY`, …).
+async fn edge_with(base_url: &str, web_dist: &str, extra: &[(&str, &str)]) -> Router {
     let mut vars = vec![
         ("WEB_DIST".to_owned(), web_dist.to_owned()),
         ("APP_NAME".to_owned(), "Test \"Shop\" Магазин".to_owned()),
     ];
+    vars.extend(
+        extra
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+    );
     for service in registry::services() {
         let key = format!("{}_URL", service.name.to_uppercase().replace('-', "_"));
         vars.push((key, base_url.to_owned()));

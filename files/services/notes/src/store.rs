@@ -5,12 +5,20 @@ use sqlx::SqlitePool;
 
 use crate::model::Note;
 
-const COLUMNS: &str = "id, title, body, pinned, created_at, updated_at";
+/// The selected columns, as a macro so every query stays one static string (sqlx refuses built SQL).
+macro_rules! select_notes {
+    ($rest:literal) => {
+        concat!(
+            "SELECT id, title, body, pinned, created_at, updated_at FROM notes ",
+            $rest
+        )
+    };
+}
 
 /// Notes of `owner`: pinned first, then the most recently updated.
 pub async fn list(db: &SqlitePool, owner: &str) -> sqlx::Result<Vec<Note>> {
-    sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM notes WHERE owner_id = ? ORDER BY pinned DESC, updated_at DESC"
+    sqlx::query_as(select_notes!(
+        "WHERE owner_id = ? ORDER BY pinned DESC, updated_at DESC"
     ))
     .bind(owner)
     .fetch_all(db)
@@ -19,13 +27,11 @@ pub async fn list(db: &SqlitePool, owner: &str) -> sqlx::Result<Vec<Note>> {
 
 /// The note `id` of `owner`, if it exists.
 pub async fn get(db: &SqlitePool, owner: &str, id: &str) -> sqlx::Result<Option<Note>> {
-    sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM notes WHERE id = ? AND owner_id = ?"
-    ))
-    .bind(id)
-    .bind(owner)
-    .fetch_optional(db)
-    .await
+    sqlx::query_as(select_notes!("WHERE id = ? AND owner_id = ?"))
+        .bind(id)
+        .bind(owner)
+        .fetch_optional(db)
+        .await
 }
 
 pub async fn insert(

@@ -17,13 +17,10 @@ pub struct User {
     pub created_at: i64,
 }
 
-const COLUMNS: &str = "id, email, name, role, created_at";
+const BY_ID: &str = "SELECT id, email, name, role, created_at FROM users WHERE id = ?";
 
 pub async fn by_id(db: &SqlitePool, id: &str) -> sqlx::Result<Option<User>> {
-    sqlx::query_as(&format!("SELECT {COLUMNS} FROM users WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(db)
-        .await
+    sqlx::query_as(BY_ID).bind(id).fetch_optional(db).await
 }
 
 /// The user with `email` (case-insensitive), with the password hash and `disabled` flag.

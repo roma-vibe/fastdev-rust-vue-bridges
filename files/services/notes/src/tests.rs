@@ -148,13 +148,25 @@ async fn notes_are_private_to_their_owner() {
         // A single local user: there is nobody else to hide notes from.
         return;
     }
-    let (_, list) = bob.send(Method::GET, "/api/notes", None).await;
-    assert_eq!(list["items"], json!([]));
-    let id = note["id"].as_str().unwrap();
-    let (status, _) = bob
-        .send(Method::DELETE, &format!("/api/notes/{id}"), None)
+    bob.send(Method::POST, "/api/notes", Some(json!({ "title": "Mine" })))
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, list) = bob.send(Method::GET, "/api/notes", None).await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(list["items"][0]["title"], "Mine", "only bob's own notes");
+
+    let uri = format!("/api/notes/{}", note["id"].as_str().unwrap());
+    let edit = Some(json!({ "title": "Hacked" }));
+    for (method, body) in [
+        (Method::GET, None),
+        (Method::PATCH, edit),
+        (Method::DELETE, None),
+    ] {
+        let (status, _) = bob.send(method.clone(), &uri, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} of another's note");
+    }
+    let (status, kept) = alice.send(Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(kept["title"], "Secret", "unchanged");
 
     let anonymous = Client {
         app: crate::routes::router(ctx),

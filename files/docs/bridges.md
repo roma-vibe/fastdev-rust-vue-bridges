@@ -67,8 +67,8 @@ What was not measured: macOS (and its `footprint`), `npm run dev` (Node and Vite
 ## Rules that keep the switch working
 
 - Services never import each other: only `app/` links them. Shared code goes to `crates/`.
-- Calls between services go through `ctx.call`, never through `reqwest` and `service_url` directly. `ctx.http` is for external APIs only.
-- A request carries only what HTTP would: extensions such as `ConnectInfo` do not exist inside a bridge, so pass what a service needs in headers (the edge sets `x-forwarded-host` and `x-forwarded-proto`).
+- Calls between services go through `ctx.call`, never through `reqwest` and `service_url` directly. `ctx.http` is for fixed, trusted external APIs only; a URL from a user, a model or a webhook setting goes through `ctx.outbound` (`crates/core/src/outbound/`).
+- A request carries only what HTTP would: extensions such as `ConnectInfo` do not exist inside a bridge, so pass what a service needs in headers (the edge sets `x-forwarded-host`, `x-forwarded-proto` and `x-client-ip`, replacing any copy the client sent).
 - No state shared in memory between services: what they share lives in the database or travels through `ctx.call`. Statics must not assume one service per process (`registry` and the migrator are read-only, which is fine).
 - Background work starts in `build` with `tokio::spawn`, not in `main`. `main.rs` stays one call.
 - The database is opened by the bootstrap only (`Ctx::new`): one pool of up to 8 SQLite connections in `app-all`, one per process otherwise, migrations under a file lock. A service never opens its own pool or runs its own migrations.

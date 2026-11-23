@@ -4,9 +4,20 @@
 
 use std::convert::Infallible;
 
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::{
+    extract::FromRequestParts,
+    http::{HeaderMap, header::AUTHORIZATION, request::Parts},
+};
 
-use crate::service::Ctx;
+use crate::{config::Config, service::Ctx};
+
+/// Whether a request carries credentials: without sign-in only an `Authorization` or `x-api-key`
+/// header (e.g. added by a proxy in front). The edge marks such responses `Cache-Control:
+/// no-store`.
+#[must_use]
+pub fn carries_credentials(headers: &HeaderMap, _config: &Config) -> bool {
+    headers.contains_key(AUTHORIZATION) || headers.contains_key("x-api-key")
+}
 
 /// Owner id of all data while the app has a single local user.
 pub const LOCAL_USER_ID: &str = "local";

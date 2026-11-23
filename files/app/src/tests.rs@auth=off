@@ -189,6 +189,18 @@ async fn some_services_in_processes_of_their_own() {
     check_everything(&app_without(&separate).await, &separate).await;
 }
 
+/// A body over `MAX_BODY_BYTES` gets 413 from the service behind the edge, before its handler.
+#[tokio::test]
+async fn bodies_over_the_limit_are_refused() {
+    let body = "a".repeat(app_core::config::DEFAULT_MAX_BODY_BYTES);
+    let input = json!({ "title": "Big", "body": body });
+    let (status, error) = Client::new(&app().await)
+        .send("POST", "/api/notes", None, Some(input))
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+    assert_eq!(error["error"]["code"], "payload_too_large");
+}
+
 /// What `BRIDGES=off` runs: nothing is reached without a socket.
 #[tokio::test]
 async fn every_service_in_a_process_of_its_own() {

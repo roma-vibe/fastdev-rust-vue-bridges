@@ -7,6 +7,13 @@ use anyhow::{Context as _, bail};
 
 use crate::{dotenv, registry};
 
+mod origins;
+
+pub use origins::origin_of;
+
+/// Default `MAX_BODY_BYTES`: the largest request body a handler reads (1 MiB).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Config {
     /// Project root: the folder of `.env` (or of `services.json`), or `APP_ROOT`.
@@ -21,8 +28,21 @@ pub struct Config {
     pub master_key: String,
     /// Interface services listen on (`BIND_HOST`, default `127.0.0.1`).
     pub bind_host: String,
-    /// Public URL users open in the browser (`PUBLIC_URL`); default: the Vite dev server or the edge.
+    /// Public URL users open in the browser (`PUBLIC_URL`); default: the Vite dev server in
+    /// development, the edge in production.
     pub public_url: String,
+    /// `APP_ENV=production|development`; default: production for release builds (`npm start`,
+    /// Docker), development for debug builds (`npm run dev`, tests).
+    pub production: bool,
+    /// Origins allowed to send state-changing requests with the session cookie: `PUBLIC_URL`, the
+    /// Vite dev server when not in production, and `ALLOWED_ORIGINS` (normalized, see
+    /// [`origin_of`]).
+    pub allowed_origins: Vec<String>,
+    /// `TRUST_PROXY` (default off): the edge takes the client address from the right-most
+    /// `X-Forwarded-For` entry instead of the TCP peer. Only behind a proxy that sets it.
+    pub trust_proxy: bool,
+    /// `MAX_BODY_BYTES` (default 1 MiB): the largest request body the services accept.
+    pub max_body_bytes: usize,
     /// Built SPA served by the edge (`WEB_DIST`, default `web/dist`).
     pub web_dist: PathBuf,
     /// `LOG_LEVEL` or `RUST_LOG` filter, default `info`.
@@ -44,6 +64,10 @@ impl fmt::Debug for Config {
             .field("db_path", &self.db_path)
             .field("bind_host", &self.bind_host)
             .field("public_url", &self.public_url)
+            .field("production", &self.production)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("trust_proxy", &self.trust_proxy)
+            .field("max_body_bytes", &self.max_body_bytes)
             .field("bridges", &self.bridges)
             .field("separate", &self.separate)
             .finish_non_exhaustive()
@@ -72,8 +96,9 @@ impl Config {
     /// Builds a config from explicit values (tests).
     ///
     /// # Errors
-    /// When `MASTER_KEY` is missing, `BRIDGES` is neither on nor off, or `SEPARATE_SERVICES` names
-    /// an unknown service.
+    /// When `MASTER_KEY` is missing, a switch (`BRIDGES`, `TRUST_PROXY`, `APP_ENV`) or a number
+    /// (`MAX_BODY_BYTES`) has an invalid value, an origin is invalid, or `SEPARATE_SERVICES`
+    /// names an unknown service.
     pub fn from_vars(root_dir: PathBuf, vars: HashMap<String, String>) -> anyhow::Result<Self> {
         let get = |key: &str, default: &str| {
             vars.get(key)
@@ -95,17 +120,30 @@ impl Config {
         let edge_port = registry::service("edge")
             .map(|s| get(&s.port_env, &s.default_port.to_string()))
             .unwrap_or_else(|| "8700".to_owned());
+        let production = match get("APP_ENV", "").to_lowercase().as_str() {
+            "" => !cfg!(debug_assertions),
+            "production" => true,
+            "development" => false,
+            other => bail!("APP_ENV must be production or development, got {other:?}"),
+        };
         let web_port = get("WEB_PORT", "");
-        let default_public = if web_port.is_empty() {
+        let default_public = if web_port.is_empty() || production {
             format!("http://localhost:{edge_port}")
         } else {
             format!("http://localhost:{web_port}")
         };
-        let bridges = match get("BRIDGES", "on").to_lowercase().as_str() {
-            "on" | "true" | "1" => true,
-            "off" | "false" | "0" => false,
-            other => bail!("BRIDGES must be on or off, got {other:?}"),
-        };
+        let public_url = get("PUBLIC_URL", &default_public)
+            .trim_end_matches('/')
+            .to_owned();
+        let allowed_origins = origins::allowed(
+            &public_url,
+            &web_port,
+            production,
+            &get("ALLOWED_ORIGINS", ""),
+        )?;
+        let max_body_bytes = get("MAX_BODY_BYTES", &DEFAULT_MAX_BODY_BYTES.to_string())
+            .parse()
+            .context("MAX_BODY_BYTES must be a number of bytes")?;
         let separate: Vec<String> = get("SEPARATE_SERVICES", "")
             .split(',')
             .map(str::trim)
@@ -121,9 +159,11 @@ impl Config {
             db_path: resolve(get("DB_PATH", "data/app.sqlite")),
             master_key,
             bind_host: get("BIND_HOST", "127.0.0.1"),
-            public_url: get("PUBLIC_URL", &default_public)
-                .trim_end_matches('/')
-                .to_owned(),
+            public_url,
+            production,
+            allowed_origins,
+            trust_proxy: switch("TRUST_PROXY", &get("TRUST_PROXY", "off"))?,
+            max_body_bytes,
             web_dist: resolve(get("WEB_DIST", "web/dist")),
             log_level: vars
                 .get("RUST_LOG")
@@ -131,7 +171,7 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .cloned()
                 .unwrap_or_else(|| "info".to_owned()),
-            bridges,
+            bridges: switch("BRIDGES", &get("BRIDGES", "on"))?,
             separate,
             root_dir,
             vars,
@@ -202,6 +242,15 @@ impl Config {
     }
 }
 
+/// An on/off value (`on`, `off`, `true`, `false`, `1`, `0`).
+fn switch(key: &str, value: &str) -> anyhow::Result<bool> {
+    match value.to_lowercase().as_str() {
+        "on" | "true" | "1" => Ok(true),
+        "off" | "false" | "0" => Ok(false),
+        other => bail!("{key} must be on or off, got {other:?}"),
+    }
+}
+
 fn find_root() -> anyhow::Result<PathBuf> {
     if let Ok(root) = env::var("APP_ROOT") {
         return Ok(PathBuf::from(root));
@@ -216,77 +265,4 @@ fn find_root() -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect()
-    }
-
-    #[test]
-    fn ports_and_urls_come_from_the_registry() {
-        let config = Config::from_vars(
-            PathBuf::from("/tmp/root"),
-            vars(&[("MASTER_KEY", "x"), ("EDGE_PORT", "9100")]),
-        )
-        .unwrap();
-        assert_eq!(config.port("edge"), 9100);
-        assert_eq!(config.service_url("edge"), "http://127.0.0.1:9100");
-        assert_eq!(config.public_url, "http://localhost:9100");
-        assert_eq!(config.db_path, PathBuf::from("/tmp/root/data/app.sqlite"));
-    }
-
-    #[test]
-    fn service_urls_can_be_overridden() {
-        let config = Config::from_vars(
-            PathBuf::from("/"),
-            vars(&[("MASTER_KEY", "x"), ("EDGE_URL", "http://edge:1/")]),
-        )
-        .unwrap();
-        assert_eq!(config.service_url("edge"), "http://edge:1");
-    }
-
-    #[test]
-    fn bridges_decide_what_runs_separately() {
-        let load = |pairs: &[(&str, &str)]| {
-            let mut all = vec![("MASTER_KEY", "x")];
-            all.extend_from_slice(pairs);
-            Config::from_vars(PathBuf::from("/"), vars(&all))
-        };
-        assert!(load(&[]).unwrap().bridges);
-        assert!(load(&[]).unwrap().separate_services().is_empty());
-        assert_eq!(
-            load(&[("SEPARATE_SERVICES", "notes, edge")])
-                .unwrap()
-                .separate_services(),
-            ["notes", "edge"]
-        );
-        let off = load(&[("BRIDGES", "off"), ("SEPARATE_SERVICES", "notes")]).unwrap();
-        assert_eq!(off.separate_services().len(), registry::services().len());
-        assert!(load(&[("BRIDGES", "maybe")]).is_err());
-        assert!(load(&[("SEPARATE_SERVICES", "nope")]).is_err());
-    }
-
-    #[test]
-    fn worker_threads_are_capped() {
-        let load = |pairs: &[(&str, &str)]| {
-            let mut all = vec![("MASTER_KEY", "x")];
-            all.extend_from_slice(pairs);
-            Config::from_vars(PathBuf::from("/"), vars(&all)).unwrap()
-        };
-        assert!((1..=4).contains(&load(&[]).worker_threads()));
-        assert_eq!(load(&[("WORKER_THREADS", "2")]).worker_threads(), 2);
-        assert!(load(&[("WORKER_THREADS", "0")]).worker_threads() >= 1);
-    }
-
-    #[test]
-    fn requires_master_key_and_hides_it() {
-        assert!(Config::from_vars(PathBuf::from("/"), HashMap::new()).is_err());
-        let config =
-            Config::from_vars(PathBuf::from("/"), vars(&[("MASTER_KEY", "top-secret")])).unwrap();
-        assert!(!format!("{config:?}").contains("top-secret"));
-    }
-}
+mod tests;

@@ -1,20 +1,31 @@
-//! `/api/auth/*`: registration, login and logout. A successful login sets the session cookie
-//! (`app_core::auth::session_cookie`); the browser sends it with every later request.
+//! `/api/auth/*`: registration, login and logout. Every login creates a new session (a fresh
+//! random token) and sets its cookie (`app_core::auth::session_cookie`); logout deletes it. Both
+//! sign-in and registration are throttled (`throttle.rs`).
+
+use std::sync::Arc;
 
 use app_core::{
     ApiError, ApiResult, Ctx, Json,
-    auth::{clear_session_cookie, create_session, delete_session, request_token, session_cookie},
+    auth::{
+        check_origin, clear_session_cookie, create_session, delete_session, request_token,
+        session_cookie,
+    },
     settings,
 };
 use axum::{
+    Extension,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{password, users};
+use crate::{
+    password,
+    throttle::{Attempt, Throttle},
+    users,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,11 +58,14 @@ pub struct RegisterInput {
 
 /// `POST /api/auth/register` `{email, password, name?}` → 201 `{user}` + session cookie.
 /// The first user becomes `admin`; later ones need the `registration_open` setting.
+/// 429 after [`crate::throttle::REGISTRATIONS_PER_HOUR`] registrations of one client.
 pub async fn register(
     State(ctx): State<Ctx>,
+    Extension(throttle): Extension<Arc<Throttle>>,
     headers: HeaderMap,
     Json(input): Json<RegisterInput>,
 ) -> ApiResult<Response> {
+    throttle.register(&headers)?;
     let email = users::clean_email(&input.email)?;
     let name = users::clean_name(&input.name)?;
     password::check(&input.password)?;
@@ -71,28 +85,40 @@ pub struct LoginInput {
     password: String,
 }
 
-/// `POST /api/auth/login` `{email, password}` → `{user}` + session cookie; 401 on wrong credentials.
+/// `POST /api/auth/login` `{email, password}` → `{user}` + session cookie; 401 on wrong credentials
+/// (the same answer, after the same work, whether the email exists or not); 429 while throttled.
 pub async fn login(
     State(ctx): State<Ctx>,
+    Extension(throttle): Extension<Arc<Throttle>>,
     headers: HeaderMap,
     Json(input): Json<LoginInput>,
 ) -> ApiResult<Response> {
-    let wrong = || ApiError::unauthorized("Wrong email or password");
+    let attempt = Attempt::new(&input.email, &headers);
+    throttle.sign_in(&attempt)?;
     let email = input.email.trim().to_lowercase();
-    let Some((user, hash, disabled)) = users::for_login(&ctx.db, &email).await? else {
-        return Err(wrong());
+    let account = users::for_login(&ctx.db, &email).await?;
+    let matches = match &account {
+        Some((_, hash, _)) => password::verify(&input.password, hash).await,
+        None => {
+            password::verify_decoy(&input.password).await;
+            false
+        }
     };
-    if !password::verify(&input.password, &hash).await {
-        return Err(wrong());
-    }
+    let Some((user, _, disabled)) = account.filter(|_| matches) else {
+        throttle.failed(&attempt);
+        return Err(ApiError::unauthorized("Wrong email or password"));
+    };
+    throttle.succeeded(&attempt);
     if disabled {
         return Err(ApiError::forbidden("This account is disabled"));
     }
     signed_in(&ctx, &headers, StatusCode::OK, user).await
 }
 
-/// `POST /api/auth/logout` → 204; deletes the current session and the cookie.
+/// `POST /api/auth/logout` → 204; deletes the current session and the cookie. A cookie logout
+/// passes the origin check like every other cookie write.
 pub async fn logout(State(ctx): State<Ctx>, headers: HeaderMap) -> ApiResult<Response> {
+    check_origin(&Method::POST, &headers, &ctx.config)?;
     if let Some(token) = request_token(&headers, &ctx.config) {
         delete_session(&ctx.db, &token).await?;
     }

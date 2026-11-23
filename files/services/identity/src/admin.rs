@@ -17,13 +17,21 @@ pub struct AdminUserRow {
     key_count: i64,
 }
 
-const SELECT: &str = "SELECT u.id, u.email, u.name, u.role, u.created_at, u.disabled,
+/// The admin view of users, as a macro so every query stays one static string (sqlx refuses built SQL).
+macro_rules! select_users {
+    ($rest:literal) => {
+        concat!(
+            "SELECT u.id, u.email, u.name, u.role, u.created_at, u.disabled,
        (SELECT COUNT(*) FROM api_keys k WHERE k.user_id = u.id AND k.revoked_at IS NULL) AS key_count
-     FROM users u";
+     FROM users u ",
+            $rest
+        )
+    };
+}
 
 /// `GET /api/admin/users` → `{items: (User & {disabled, keyCount})[]}`, oldest first.
 pub async fn list(State(ctx): State<Ctx>, _admin: AdminUser) -> ApiResult<Json<Value>> {
-    let items: Vec<AdminUserRow> = sqlx::query_as(&format!("{SELECT} ORDER BY u.created_at"))
+    let items: Vec<AdminUserRow> = sqlx::query_as(select_users!("ORDER BY u.created_at"))
         .fetch_all(&ctx.db)
         .await?;
     Ok(Json(json!({ "items": items })))
@@ -73,7 +81,7 @@ pub async fn update(
                 .await?;
         }
     }
-    let row: Option<AdminUserRow> = sqlx::query_as(&format!("{SELECT} WHERE u.id = ?"))
+    let row: Option<AdminUserRow> = sqlx::query_as(select_users!("WHERE u.id = ?"))
         .bind(&id)
         .fetch_optional(&ctx.db)
         .await?;

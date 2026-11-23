@@ -10,15 +10,19 @@ use app_core::{
 };
 use axum::{
     Router,
-    body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    body::Body,
+    http::{Request, StatusCode},
     routing::get,
 };
 use futures::StreamExt as _;
-use serde_json::{Value, json};
+use serde_json::json;
 use tower::ServiceExt as _;
 
 use super::{PACKAGE, SERVICES, plan};
+
+mod journey;
+
+use journey::{Client, check_journey};
 
 async fn app() -> Router {
     let ctx = Ctx::for_tests("app").await.unwrap();
@@ -59,52 +63,6 @@ async fn app_without(separate: &[&str]) -> Router {
     routers.remove("edge").unwrap()
 }
 
-/// A client of the edge that keeps the session cookie like a browser.
-struct Client {
-    app: Router,
-    cookie: Option<String>,
-}
-
-impl Client {
-    fn new(app: &Router) -> Self {
-        Self {
-            app: app.clone(),
-            cookie: None,
-        }
-    }
-
-    async fn send(
-        &mut self,
-        method: &str,
-        path: &str,
-        bearer: Option<&str>,
-        body: Option<Value>,
-    ) -> (StatusCode, Value) {
-        let mut req = Request::builder().method(method).uri(path);
-        if let Some(cookie) = &self.cookie {
-            req = req.header(header::COOKIE, cookie);
-        }
-        if let Some(token) = bearer {
-            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        let req = match body {
-            Some(body) => req
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())),
-            None => req.body(Body::empty()),
-        };
-        let response = self.app.clone().oneshot(req.unwrap()).await.unwrap();
-        if let Some(set) = response.headers().get(header::SET_COOKIE) {
-            let pair = set.to_str().unwrap().split(';').next().unwrap().to_owned();
-            self.cookie = (!pair.ends_with('=')).then_some(pair);
-        }
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, value)
-    }
-}
-
 /// Every service answers `/health` and says which of them are out of the process.
 async fn check_health(app: &Router, separate: &[&str]) {
     let (status, health) = Client::new(app)
@@ -120,86 +78,6 @@ async fn check_health(app: &Router, separate: &[&str]) {
         assert_eq!(service["version"], env!("CARGO_PKG_VERSION"), "{service}");
         assert_eq!(service["bridged"], !separate.contains(&name), "{service}");
     }
-}
-
-/// What a user does with every service through the edge: an account (identity), a session cookie,
-/// a personal API key, notes over that key (notes authenticates against identity's tables), the
-/// admin list, errors, logout.
-async fn check_journey(app: &Router) {
-    let mut browser = Client::new(app);
-    let (status, user) = browser
-        .send(
-            "POST",
-            "/api/auth/register",
-            None,
-            Some(json!({"email": "a@example.com", "password": "correct horse", "name": "A"})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{user}");
-    assert!(browser.cookie.is_some(), "the cookie passes the edge");
-
-    let (status, me) = browser.send("GET", "/api/me", None, None).await;
-    assert_eq!(status, StatusCode::OK, "{me}");
-    assert_eq!(me["email"], "a@example.com");
-    assert_eq!(me["role"], "admin");
-
-    let (status, key) = browser
-        .send("POST", "/api/keys", None, Some(json!({"name": "script"})))
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{key}");
-    let secret = key["secret"].as_str().unwrap().to_owned();
-
-    let mut script = Client::new(app);
-    let (status, note) = script
-        .send(
-            "POST",
-            "/api/notes",
-            Some(&secret),
-            Some(json!({"title": "Hello", "body": "over the bridge"})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::CREATED, "{note}");
-    let id = note["id"].as_str().unwrap();
-    let (status, note) = script
-        .send(
-            "PATCH",
-            &format!("/api/notes/{id}?x=1"),
-            Some(&secret),
-            Some(json!({"pinned": true})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{note}");
-    assert_eq!(note["pinned"], true);
-    let (status, list) = browser.send("GET", "/api/notes", None, None).await;
-    assert_eq!(status, StatusCode::OK, "{list}");
-    assert_eq!(list["items"].as_array().unwrap().len(), 1);
-
-    let (status, users) = browser.send("GET", "/api/admin/users", None, None).await;
-    assert_eq!(status, StatusCode::OK, "{users}");
-
-    let (status, error) = script
-        .send(
-            "POST",
-            "/api/notes",
-            Some(&secret),
-            Some(json!({"title": ""})),
-        )
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
-    assert_eq!(error["error"]["code"], "bad_request");
-    let (status, _) = Client::new(app).send("GET", "/api/notes", None, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _) = browser.send("GET", "/api/nothing", None, None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-
-    let (status, _) = browser.send("POST", "/api/auth/logout", None, None).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(
-        browser.cookie.is_none(),
-        "the cleared cookie passes the edge"
-    );
-    let (status, _) = browser.send("GET", "/api/me", None, None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// The same journey wherever the services run.
@@ -230,6 +108,18 @@ async fn all_services_in_one_process() {
 async fn some_services_in_processes_of_their_own() {
     let separate = ["notes"];
     check_everything(&app_without(&separate).await, &separate).await;
+}
+
+/// A body over `MAX_BODY_BYTES` gets 413 from the service behind the edge, before its handler.
+#[tokio::test]
+async fn bodies_over_the_limit_are_refused() {
+    let password = "a".repeat(app_core::config::DEFAULT_MAX_BODY_BYTES);
+    let input = json!({ "email": "a@example.com", "password": password });
+    let (status, error) = Client::new(&app().await)
+        .send("POST", "/api/auth/register", None, Some(input))
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+    assert_eq!(error["error"]["code"], "payload_too_large");
 }
 
 /// What `BRIDGES=off` runs: nothing is reached without a socket.

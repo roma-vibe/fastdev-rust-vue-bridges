@@ -10,17 +10,21 @@
 //! - [`service`]: [`Ctx`], [`service::main`] (one service in its own process) and
 //!   [`service::host`] (all of them in `app-all`), the bootstrap shared by all services
 //! - [`bridge`]: how services call each other ([`Ctx::call`]): in-process or over HTTP
+//! - [`outbound`]: the SSRF-safe client (`ctx.outbound`) for URLs from users, models or webhooks
+//! - [`client_ip`]: the client address the edge passes to the services (limits, logs)
 //!
 //! Services never read env vars, open the database or set up tracing themselves: they are
 //! libraries with `build(ctx)` and get a ready [`Ctx`] from [`service::main`] or [`service::host`].
 
 pub mod bridge;
 pub mod caller;
+pub mod client_ip;
 pub mod config;
 pub mod crypto;
 pub mod db;
 mod dotenv;
 pub mod error;
+pub mod outbound;
 pub mod registry;
 pub mod service;
 pub mod settings;

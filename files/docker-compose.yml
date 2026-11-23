@@ -14,10 +14,12 @@ services:
       BIND_HOST: 0.0.0.0
       DB_PATH: /app/data/app.sqlite
       WEB_DIST: /app/web/dist
-      PUBLIC_URL: http://localhost:${EDGE_PORT:-8700}
+      # The public address from .env (its origin may send cookie-signed writes), else the edge.
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:${EDGE_PORT:-8700}}
     ports:
-      # Only the edge is published; with separate services the others stay inside the container.
-      - '${EDGE_PORT:-8700}:${EDGE_PORT:-8700}'
+      # Only the edge is published, on the host's loopback only; with separate services the others
+      # stay inside the container.
+      - '127.0.0.1:${EDGE_PORT:-8700}:${EDGE_PORT:-8700}'
     volumes:
       # DOCKER_DATA: `data` (named volume) or `./data` (the project folder).
       - ${DOCKER_DATA:-data}:/app/data

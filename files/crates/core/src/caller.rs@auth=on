@@ -3,10 +3,24 @@
 
 use axum::{
     extract::{FromRef, FromRequestParts},
-    http::request::Parts,
+    http::{HeaderMap, header::AUTHORIZATION, request::Parts},
 };
 
-use crate::{auth::AuthUser, error::ApiError, service::Ctx};
+use crate::{
+    auth::{AuthUser, read_cookie, session_cookie_name},
+    config::Config,
+    error::ApiError,
+    service::Ctx,
+};
+
+/// Whether a request carries credentials (a key or the session cookie), valid or not: the edge
+/// marks such responses `Cache-Control: no-store`.
+#[must_use]
+pub fn carries_credentials(headers: &HeaderMap, config: &Config) -> bool {
+    headers.contains_key(AUTHORIZATION)
+        || headers.contains_key("x-api-key")
+        || read_cookie(headers, &session_cookie_name(config)).is_some()
+}
 
 /// The signed-in user of a request (session cookie or API key); 401 when nobody is signed in.
 #[derive(Debug, Clone, PartialEq, Eq)]

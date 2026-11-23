@@ -8,135 +8,35 @@
 //! ```
 //!
 //! [`main`] / [`run`] load the config, set up tracing, open the database (applying migrations),
-//! build a [`Ctx`], add `GET /health`, request tracing and graceful shutdown, and listen on the port
-//! of the service from `services.json`.
+//! build a [`Ctx`], add `GET /health`, request tracing, the request body limit (`MAX_BODY_BYTES`)
+//! and graceful shutdown, and listen on the port of the service from `services.json`. Servers pass
+//! the TCP peer address to handlers (`ConnectInfo<SocketAddr>`): the edge records it as the client
+//! address (`crate::client_ip`).
 //!
 //! `app-all` calls [`host`] instead: every service in one process, over one database pool and one
 //! HTTP client, connected by [`bridges`](crate::bridge) (`docs/bridges.md`).
 
-use std::{collections::HashMap, future::Future, ops::Deref, pin::Pin, sync::Arc, time::Duration};
+mod ctx;
+
+use std::{collections::HashMap, future::Future, net::SocketAddr, pin::Pin, time::Duration};
 
 use anyhow::{Context as _, bail};
-use axum::{Router, body::Body, extract::Request, http, response::Response, routing::get};
+use axum::{
+    Router,
+    body::Body,
+    extract::{DefaultBodyLimit, connect_info::IntoMakeServiceWithConnectInfo},
+    http,
+    routing::get,
+};
+pub use ctx::{Ctx, CtxInner};
 use serde_json::json;
-use sqlx::SqlitePool;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    bridge::{Bridges, Unreachable},
-    config::Config,
-    crypto::Crypto,
-    db,
-    error::Json,
-};
+use crate::{config::Config, error::Json};
 
 /// How long in-flight requests may finish after a stop signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
-/// Shared state of a service: config, database pool, secret encryption, an HTTP client for the
-/// outside world and the bridges to the other services. Cheap to clone. Use it as the axum state
-/// (or derive `FromRef<YourState> for Ctx`).
-#[derive(Clone, Debug)]
-pub struct Ctx(Arc<CtxInner>);
-
-#[derive(Debug)]
-pub struct CtxInner {
-    /// Name of the running service (from `services.json`).
-    pub service: String,
-    pub config: Config,
-    pub db: SqlitePool,
-    pub crypto: Crypto,
-    /// Shared outbound HTTP client for external APIs (connection pooling); per-request timeouts are
-    /// set by callers. Other services of this app are called with [`Ctx::call`], never with it.
-    pub http: reqwest::Client,
-    /// The way to the other services: use [`Ctx::call`].
-    pub bridges: Arc<Bridges>,
-}
-
-impl Deref for Ctx {
-    type Target = CtxInner;
-    fn deref(&self) -> &CtxInner {
-        &self.0
-    }
-}
-
-impl Ctx {
-    /// Builds a context from a loaded config: opens the database and applies migrations.
-    ///
-    /// # Errors
-    /// When the database or the master key cannot be used.
-    pub async fn new(service: &str, config: Config) -> anyhow::Result<Self> {
-        let db = db::connect(&config.db_path).await?;
-        Self::with_db(service, config, db)
-    }
-
-    /// A context over an existing pool (tests use [`db::connect_memory`]).
-    ///
-    /// # Errors
-    /// When the master key is invalid.
-    pub fn with_db(service: &str, config: Config, db: SqlitePool) -> anyhow::Result<Self> {
-        let crypto = Crypto::new(&config.master_key)?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("app/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        Ok(Self(Arc::new(CtxInner {
-            service: service.to_owned(),
-            config,
-            db,
-            crypto,
-            http,
-            bridges: Arc::default(),
-        })))
-    }
-
-    /// The same resources (database pool, HTTP client, bridges) under the name of another service
-    /// hosted by this process.
-    #[must_use]
-    pub fn for_service(&self, service: &str) -> Self {
-        Self(Arc::new(CtxInner {
-            service: service.to_owned(),
-            config: self.config.clone(),
-            db: self.db.clone(),
-            crypto: self.crypto.clone(),
-            http: self.http.clone(),
-            bridges: self.bridges.clone(),
-        }))
-    }
-
-    /// Calls another service, in this process or over HTTP (`crate::bridge`). The URI of `req` is
-    /// the path and query; the caller sets any timeout.
-    ///
-    /// # Errors
-    /// [`Unreachable`] when the service has not answered; its error statuses are normal responses.
-    pub async fn call(&self, service: &str, req: Request) -> Result<Response, Unreachable> {
-        self.bridges.send(&self.config, service, req).await
-    }
-
-    /// A ready context for tests: in-memory database with migrations, random master key.
-    ///
-    /// # Errors
-    /// When migrations fail.
-    pub async fn for_tests(service: &str) -> anyhow::Result<Self> {
-        Self::for_tests_with(service, &[]).await
-    }
-
-    /// Like [`Ctx::for_tests`], with extra config values (e.g. `("NOTES_URL", "http://…")`).
-    ///
-    /// # Errors
-    /// When migrations fail.
-    pub async fn for_tests_with(service: &str, vars: &[(&str, &str)]) -> anyhow::Result<Self> {
-        let mut map: HashMap<String, String> = vars
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        map.entry("MASTER_KEY".to_owned())
-            .or_insert_with(crate::crypto::generate_master_key);
-        let config = Config::from_vars(std::env::temp_dir(), map)?;
-        Self::with_db(service, config, db::connect_memory().await?)
-    }
-}
 
 /// Initializes tracing (`LOG_LEVEL` / `RUST_LOG`) once per process. `with_target` adds the module
 /// to every line, which tells the services apart when they share a process.
@@ -191,13 +91,13 @@ where
     init_tracing(&config, false);
     let addr = address(&config, name);
     let ctx = Ctx::new(name, config).await?;
-    let router = finish(name, build(ctx.clone()).await?);
+    let router = finish(name, &ctx.config, build(ctx.clone()).await?);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("{name}: cannot listen on {addr}"))?;
     tracing::info!("{name} listening on http://{addr}");
-    axum::serve(listener, router)
+    axum::serve(listener, with_peer(router))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     tracing::info!("{name} stopped");
@@ -247,7 +147,7 @@ pub async fn host(config: Config, services: &[(&str, Build)]) -> anyhow::Result<
             .clone();
         tracing::info!("{name} listening on http://{addr}");
         servers.push(async move {
-            axum::serve(listener, router)
+            axum::serve(listener, with_peer(router))
                 .with_graceful_shutdown(shutdown_signal())
                 .await
         });
@@ -278,7 +178,7 @@ pub async fn assemble(
         let router = build(ctx.for_service(name))
             .await
             .with_context(|| format!("starting {name}"))?;
-        routers.insert((*name).to_owned(), finish(name, router));
+        routers.insert((*name).to_owned(), finish(name, &ctx.config, router));
     }
     ctx.bridges.connect(routers.clone());
     Ok(routers)
@@ -288,9 +188,16 @@ fn address(config: &Config, name: &str) -> String {
     format!("{}:{}", config.bind_host, config.port(name))
 }
 
-/// Adds `GET /health` and request tracing; the span names the service, so requests of services
-/// sharing a process stay apart in the logs (a bridged call is a span inside the caller's one).
-fn finish(name: &str, router: Router) -> Router {
+/// The router as a server that records the peer address of every connection.
+fn with_peer(router: Router) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    router.into_make_service_with_connect_info::<SocketAddr>()
+}
+
+/// Adds `GET /health`, request tracing and the body limit: extractors (`Json`, `Bytes`, `Form`)
+/// reject bodies over `MAX_BODY_BYTES` with 413. The span names the service, so requests of
+/// services sharing a process stay apart in the logs (a bridged call is a span inside the
+/// caller's one).
+fn finish(name: &str, config: &Config, router: Router) -> Router {
     let service = name.to_owned();
     let trace = TraceLayer::new_for_http().make_span_with(move |req: &http::Request<Body>| {
         tracing::debug_span!("request", service = %service, method = %req.method(), uri = %req.uri())
@@ -301,6 +208,7 @@ fn finish(name: &str, router: Router) -> Router {
                 .route("/health", get(health))
                 .with_state(name.to_owned()),
         )
+        .layer(DefaultBodyLimit::max(config.max_body_bytes))
         .layer(trace)
 }
 

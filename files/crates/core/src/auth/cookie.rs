@@ -1,14 +1,17 @@
 //! The session cookie: its name, reading it from requests and the `Set-Cookie` values.
 //!
 //! The name contains `APP_SLUG` because browsers share cookies between ports of one host: two
-//! projects on `localhost` must not overwrite each other's sessions.
+//! projects on `localhost` must not overwrite each other's sessions. Behind HTTPS it also gets the
+//! `__Host-` prefix: browsers then accept it only with `Secure`, `Path=/` and no `Domain`, so a
+//! sibling subdomain or a plain-HTTP page cannot plant or overwrite it.
 
 use axum::http::{HeaderMap, HeaderValue, header::COOKIE};
 
 use super::token::SESSION_TTL_MS;
 use crate::config::Config;
 
-/// `<APP_SLUG>-session`, limited to characters that are valid in cookie names.
+/// `<APP_SLUG>-session` (`__Host-<APP_SLUG>-session` behind HTTPS), limited to characters that
+/// are valid in cookie names.
 #[must_use]
 pub fn session_cookie_name(config: &Config) -> String {
     let slug: String = config
@@ -16,11 +19,20 @@ pub fn session_cookie_name(config: &Config) -> String {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    if slug.is_empty() {
+    let name = if slug.is_empty() {
         "session".to_owned()
     } else {
         format!("{slug}-session")
+    };
+    if is_secure(config) {
+        format!("__Host-{name}")
+    } else {
+        name
     }
+}
+
+fn is_secure(config: &Config) -> bool {
+    config.public_url.starts_with("https://")
 }
 
 /// The value of cookie `name` in the `Cookie` headers of a request.
@@ -50,11 +62,7 @@ pub fn clear_session_cookie(config: &Config) -> HeaderValue {
 }
 
 fn build(config: &Config, value: &str, max_age_secs: i64) -> HeaderValue {
-    let secure = if config.public_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = if is_secure(config) { "; Secure" } else { "" };
     let cookie = format!(
         "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}{secure}",
         session_cookie_name(config)
@@ -109,7 +117,12 @@ mod tests {
         );
         assert!(!plain.to_str().unwrap().contains("Secure"));
         let secure = session_cookie(&config("app", "https://example.com"), "t");
-        assert!(secure.to_str().unwrap().ends_with("; Secure"));
+        let secure = secure.to_str().unwrap();
+        assert!(
+            secure.starts_with("__Host-app-session=t; Path=/;"),
+            "{secure}"
+        );
+        assert!(secure.ends_with("; Secure") && !secure.contains("Domain"));
         let cleared = clear_session_cookie(&config("app", "http://x"));
         assert!(cleared.to_str().unwrap().contains("Max-Age=0"));
     }

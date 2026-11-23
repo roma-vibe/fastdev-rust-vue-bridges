@@ -17,7 +17,7 @@ all services ──► one SQLite file (WAL), migrations in migrations/
 | Path | Kind | Purpose |
 | --- | --- | --- |
 | `services.json` | registry | Service names, Cargo packages, port env keys (`<NAME>_PORT`) and the URL prefixes the edge routes. Single source for the core crate, the edge, `app/` (a test keeps them in step) and the scripts. |
-| `crates/core` (`app-core`) | library | Config from `.env` (`Config`), registry, SQLite pool + migrations, `ApiError`, {% if features.auth %}auth extractors (`AuthUser`, `AdminUser`), {% endif %}`Caller`, AES-GCM `Crypto`, settings, bridges (`Ctx::call`), the bootstrap (`service::main` for one service, `service::host` for all). |
+| `crates/core` (`app-core`) | library | Config from `.env` (`Config`), registry, SQLite pool + migrations, `ApiError`, {% if features.auth %}auth extractors (`AuthUser`, `AdminUser`) with the origin check, {% endif %}`Caller`, AES-GCM `Crypto`, settings, bridges (`Ctx::call`), the SSRF-safe `ctx.outbound`, the client address (`client_ip`), the bootstrap (`service::main` for one service, `service::host` for all). |
 | `services/<name>` (`app-<name>`) | library + binary | One service each: `lib.rs` has `build(ctx)` (router and background work), `main.rs` is `app_core::service::main(name, build)`; routes in `routes.rs`, logic in further modules, route tests in `tests.rs`. |
 | `app/` (`app-all`) | binary | Every service in one process over one runtime, pool and HTTP client; only the edge listens. `--plan` prints the binaries for the current settings. Tests of the whole app in all three modes. |
 | `migrations/` | SQL | Shared schema; every table has one **owner** service that writes it (the comment above the table). |
@@ -27,7 +27,7 @@ all services ──► one SQLite file (WAL), migrations in migrations/
 ## Rules
 
 - **Ownership.** A service writes only the tables it owns. It may read other tables; for anything else it calls the owner's HTTP API with `ctx.call("<name>", request)` (a bridge: in-process or HTTP, `docs/bridges.md`), never with `ctx.http` + `service_url`.
-- **Bridges.** Services never import each other, share nothing in memory, read only headers from a request (no `ConnectInfo`), start background work in `build` and put CPU work on `spawn_blocking`. `app/src/tests.rs` checks the app in all modes.
+- **Bridges.** Services never import each other, share nothing in memory, read only headers from a request (no `ConnectInfo`; the edge, which sees the TCP peer, passes the client address as `x-client-ip`), start background work in `build` and put CPU work on `spawn_blocking`. `app/src/tests.rs` checks the app in all modes.
 - **Shared code** goes to a crate in `crates/`, never copied between services. Keep `app-core` free of business logic.
 - **Schema changes** are a new numbered file in `migrations/` (never edit an applied one). The bootstrap applies pending migrations on start: once in `app-all`, in every process when services run separately (one sqlx migrator, same database, a lock file prevents races).
 - **Contract.** Every endpoint is documented in `docs/api.md`; change the doc with the code.

@@ -1,8 +1,9 @@
 //! Authentication shared by all services (the identity service creates users, sessions and keys).
 //!
 //! A request is signed in by
-//! - the **session cookie** (`<APP_SLUG>-session`, HttpOnly, SameSite=Lax), set by the identity
-//!   service at login and sent by the browser automatically, or
+//! - the **session cookie** (`<APP_SLUG>-session`, `__Host-<APP_SLUG>-session` behind HTTPS;
+//!   HttpOnly, SameSite=Lax), set by the identity service at login and sent by the browser
+//!   automatically; state-changing requests signed in by it must pass [`check_origin`], or
 //! - a **personal API key** (`sk-…`) in `Authorization: Bearer <key>` or `x-api-key: <key>`, for
 //!   programs and scripts (a session token in `Authorization: Bearer` works too).
 //!
@@ -10,6 +11,7 @@
 //! Handlers take [`AuthUser`] (any signed-in user) or [`AdminUser`] (role `admin`) as an argument.
 
 mod cookie;
+mod origin;
 mod token;
 
 use axum::{
@@ -19,6 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 pub use cookie::{clear_session_cookie, read_cookie, session_cookie, session_cookie_name};
+pub use origin::check_origin;
 pub use token::{
     API_KEY_PREFIX, SESSION_PREFIX, SESSION_TTL_MS, authenticate, create_session, delete_session,
 };
@@ -104,6 +107,7 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let ctx = Ctx::from_ref(state);
+        check_origin(&parts.method, &parts.headers, &ctx.config)?;
         let Some(token) = request_token(&parts.headers, &ctx.config) else {
             return Err(ApiError::unauthorized("Sign in or pass an API key"));
         };

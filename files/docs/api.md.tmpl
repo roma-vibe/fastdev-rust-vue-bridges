@@ -3,11 +3,11 @@
 All services are reached through the **edge** (`EDGE_PORT`); in development Vite proxies `/api` to it. The owner of every URL prefix is in `services.json`. JSON uses **camelCase**; times are Unix **milliseconds**; ids are strings (UUID v7) unless noted.
 
 {% if features.auth -%}
-**Auth:** the web app signs in with an HttpOnly session cookie (`<APP_SLUG>-session`, set by login/register). Programs send `Authorization: Bearer <token>` (or `x-api-key: <token>`) with a personal API key (`sk-…`) or a session token. Extractors in `app_core::auth`: `AuthUser` (any signed-in user), `AdminUser` (role `admin`), and `app_core::Caller` (the user a request acts for).
+**Auth:** the web app signs in with an HttpOnly session cookie (`<APP_SLUG>-session`, `__Host-<APP_SLUG>-session` behind https; set by login/register). A cookie-signed `POST`/`PUT`/`PATCH`/`DELETE` needs an allowed `Origin` (`PUBLIC_URL`, the Vite dev server in development, `ALLOWED_ORIGINS`), else 403. Programs send `Authorization: Bearer <token>` (or `x-api-key: <token>`) with a personal API key (`sk-…`) or a session token. Extractors in `app_core::auth`: `AuthUser` (any signed-in user), `AdminUser` (role `admin`), and `app_core::Caller` (the user a request acts for).
 {%- else -%}
 **Auth:** the app has no sign-in yet; every request acts for one local user (`app_core::Caller`, id `local`). Per-user data is still scoped by `Caller::user_id`, so adding accounts later only changes the extractor.
 {%- endif %}
-**Errors (every service):** `{"error": {"code": "bad_request|unauthorized|forbidden|not_found|conflict|unavailable|internal", "message": "…"}}` with the matching status (`app_core::ApiError`).
+**Errors (every service):** `{"error": {"code": "bad_request|unauthorized|forbidden|not_found|conflict|payload_too_large|rate_limited|unavailable|internal", "message": "…"}}` with the matching status (`app_core::ApiError`); 429 adds `Retry-After` (seconds), 413 means a body over `MAX_BODY_BYTES`, and `internal` never carries details.
 **Lists** return `{"items": [...]}`.
 
 Changing a shape here is a contract change: update this file in the same change as the code.
@@ -38,8 +38,8 @@ type ApiKey = { id: string; name: string; prefix: string; createdAt: number; las
 | Method | Path | Body → Response |
 | --- | --- | --- |
 | GET | `/api/auth/config` | → `{ registrationOpen: boolean, hasUsers: boolean }` (public) |
-| POST | `/api/auth/register` | `{email, password (≥ 8), name?}` → 201 `{user}` + session cookie. The first user becomes `admin`. 403 when registration is closed (setting `registration_open`, ignored for the first user). 409 email taken |
-| POST | `/api/auth/login` | `{email, password}` → `{user}` + session cookie; 401 wrong credentials, 403 disabled |
+| POST | `/api/auth/register` | `{email, password (≥ 8), name?}` → 201 `{user}` + session cookie. The first user becomes `admin`. 403 when registration is closed (setting `registration_open`, ignored for the first user). 409 email taken. 429 after 10 registrations of one client per hour |
+| POST | `/api/auth/login` | `{email, password}` → `{user}` + session cookie (a new session each time); 401 wrong credentials, 403 disabled; 429 + `Retry-After` while throttled (after 5 failures per email or client in 15 min, or 30 attempts per client in 10 min), the same for unknown emails |
 | POST | `/api/auth/logout` | → 204 (deletes the current session and the cookie) |
 | GET | `/api/me` | → `User` |
 | PATCH | `/api/me` | `{name?}` → `User` |

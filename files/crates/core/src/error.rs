@@ -2,9 +2,11 @@
 //! `{"error": {"code": "<code>", "message": "<text>"}}` with a matching HTTP status.
 //! 5xx details are logged, never sent to clients.
 
+use std::time::Duration;
+
 use axum::{
     extract::{FromRequest, rejection::JsonRejection},
-    http::StatusCode,
+    http::{StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -21,8 +23,15 @@ pub enum ApiError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    /// 429 with `Retry-After: <retry_after_secs>`.
+    #[error("{message}")]
+    TooManyRequests {
+        message: String,
+        retry_after_secs: u64,
+    },
+    /// The request body is over `MAX_BODY_BYTES` (413).
     #[error("{0}")]
-    TooManyRequests(String),
+    PayloadTooLarge(String),
     /// Temporarily unavailable, e.g. a service the request needs is down (503).
     #[error("{0}")]
     Unavailable(String),
@@ -41,7 +50,8 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -56,7 +66,8 @@ impl ApiError {
             Self::Forbidden(_) => "forbidden",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
-            Self::TooManyRequests(_) => "rate_limited",
+            Self::TooManyRequests { .. } => "rate_limited",
+            Self::PayloadTooLarge(_) => "payload_too_large",
             Self::Unavailable(_) => "unavailable",
             Self::Internal(_) => "internal",
         }
@@ -79,6 +90,14 @@ impl ApiError {
     }
     pub fn unavailable(msg: impl Into<String>) -> Self {
         Self::Unavailable(msg.into())
+    }
+    /// 429: try again after `retry_after` (sent as whole seconds, at least 1).
+    pub fn too_many_requests(msg: impl Into<String>, retry_after: Duration) -> Self {
+        let millis = u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX);
+        Self::TooManyRequests {
+            message: msg.into(),
+            retry_after_secs: millis.div_ceil(1000).max(1),
+        }
     }
 }
 
@@ -108,7 +127,16 @@ impl IntoResponse for ApiError {
                 message,
             },
         };
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if let Self::TooManyRequests {
+            retry_after_secs, ..
+        } = self
+        {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, retry_after_secs.into());
+        }
+        response
     }
 }
 
@@ -126,6 +154,9 @@ impl From<sqlx::Error> for ApiError {
 
 impl From<JsonRejection> for ApiError {
     fn from(rejection: JsonRejection) -> Self {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return Self::PayloadTooLarge("The request body is too large".into());
+        }
         Self::BadRequest(rejection.body_text())
     }
 }
@@ -170,5 +201,16 @@ mod tests {
         let (status, json) = body(ApiError::Internal(anyhow::anyhow!("disk on fire"))).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(json["error"]["message"], "Internal server error");
+        assert_eq!(json["error"]["code"], "internal");
+    }
+
+    #[tokio::test]
+    async fn rate_limits_say_when_to_retry() {
+        let err = ApiError::too_many_requests("Slow down", Duration::from_millis(1500));
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "2");
+        let instant = ApiError::too_many_requests("Slow down", Duration::ZERO);
+        assert_eq!(instant.into_response().headers()[RETRY_AFTER], "1");
     }
 }
