@@ -61,7 +61,7 @@ What was not measured: macOS (and its `footprint`), `npm run dev` (Node and Vite
 
 - **A crash takes everything down.** A panic in a request stays contained, as in a separate service (the bridge catches it and the caller gets 503), but an abort, running out of memory or a stack overflow ends the whole process. Docker restarts it (`restart: unless-stopped`); a bare `node scripts/start.ts` does not. The runner restarts crashed processes only when there are several.
 - **One restart, one scale.** You cannot restart, deploy or scale a single service alone. When you need that for one of them, use `SEPARATE_SERVICES`.
-- **A shared runtime.** A service that blocks a worker slows the others, so CPU work belongs on blocking threads (`spawn_blocking`), as password hashing does (`services/identity/src/password.rs`).
+- **A shared runtime.** A service that blocks a worker slows the others, so CPU work belongs on blocking threads (`spawn_blocking`){% if features.auth %}, as password hashing does (`services/identity/src/password.rs`){% endif %}.
 - **One log.** All services write into one output. Lines carry the module (`app_identity::…`), and the request spans (`LOG_LEVEL=debug`) name the service; a bridged call is a span inside the edge's.
 
 ## Rules that keep the switch working

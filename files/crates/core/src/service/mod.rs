@@ -42,6 +42,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// to every line, which tells the services apart when they share a process.
 pub fn init_tracing(config: &Config, with_target: bool) {
     let filter = EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    // Fails when a subscriber is already installed (a test, another service in this process).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(with_target)
@@ -221,6 +222,7 @@ async fn health(
 /// Resolves on Ctrl+C or SIGTERM.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
+        // An error (no handler could be installed) ends the wait too, so the service still stops.
         let _ = tokio::signal::ctrl_c().await;
     };
     #[cfg(unix)]

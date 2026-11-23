@@ -54,6 +54,7 @@ pub async fn verify_decoy(password: &str) {
             Err(_) => return,
         },
     };
+    // Only the time matters: the result of verifying against the decoy hash is never used.
     let _ = verify(password, &decoy).await;
 }
 

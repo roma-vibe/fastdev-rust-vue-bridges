@@ -42,6 +42,7 @@ pub struct Bridges {
 impl Bridges {
     /// Connects the routers of the services this process hosts.
     pub(crate) fn connect(&self, routers: HashMap<String, Router>) {
+        // Already connected means a second `connect` call: the first set of routers stays.
         let _ = self.local.set(routers);
     }
 

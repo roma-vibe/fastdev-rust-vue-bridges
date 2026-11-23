@@ -30,8 +30,10 @@ migrations/             SQL migrations, one block of numbers per owner service
 web/src/app/            shell: router, layouts, sidebar, theme/locale switches, toasts
 web/src/shared/         http client, i18n, theme, toasts, format helpers, UI kit{% if features.auth %}, auth store{% endif %}
 web/src/features/       one module per feature: home, notes{% if features.auth %}, auth, profile, keys{% endif %}
-scripts/                setup.ts (.env), dev.ts (services + Vite), start.ts (release builds), security.ts (secbase check), lib/topology.ts (which processes run)
+scripts/                setup.ts (.env), dev.ts (services + Vite), start.ts (release builds), security.ts (secbase check), walls.ts (walls check), lib/topology.ts (which processes run)
 secbase.json            security gate config: profile web-public, ignored paths, allowed findings with reasons
+walls.json              walls settings: ignored paths, allowed findings with reasons
+.walls/rules.json       project walls (data only), see Quality walls
 docs/                   architecture.md, bridges.md, api.md, frontend.md
 {%- if choices.docker == "run" %}
 Dockerfile, docker-compose.yml, docker/   production image: app-all, every service binary and the web app
@@ -65,6 +67,15 @@ The defaults protect a public web app. Never weaken them to make something work:
 - **Before touching** authentication, access control, input handling, outbound requests, uploads or LLM features, read `secbase checklist <area>` (`secbase checklist` lists the areas).
 - `npm run check` ends with `npm run security` (`secbase check`, profile in `secbase.json`); an exception goes into its `allow` list with a reason.
 
+## Quality walls
+
+`walls` is the model-free code-quality gate: fixed rules, same answer every time. `npm run check` includes `walls check` right before the security step; `npm run walls` runs it alone (`npm run walls -- --json` for the full report). Project settings are in `walls.json`, project walls in `.walls/rules.json`.
+
+- Never weaken the lint, tsc or clippy configuration (rules, `strict`, `--max-warnings`, `-D warnings`) and never add a suppression without a reason. A finding is silenced only with a `walls-ignore <rule>: <reason>` comment on its line or the line above; fix the cause first.
+- When a reviewer or the owner points out a mistake for the second time, do not write a note: add a project wall to `.walls/rules.json` (`id` `project/<name>`, `message`, `pattern`, `files` and a `reason` that names the incident), then fix the current hits.
+- `walls rules` lists the built-in rules; `walls rules --explain <id>` says why a rule exists. Do not edit `.walls/baseline.json` by hand: `walls baseline` rewrites it. Loosening the gate (a new `ignore` entry `{ "path", "reason" }` or `allow` entry in `walls.json`, a weaker project wall, a bigger baseline) is a `gate/loosened` error until the owner commits it: ask him instead.
+- Install walls once: `npm link` in `~/Documents/walls`. Without it the step fails, in CI too; only `WALLS_OPTIONAL=1` turns that into a skip with a notice. Never set it to get a green check.
+
 ## Commands
 
 | Command | What it does |
@@ -73,7 +84,8 @@ The defaults protect a public web app. Never weaken them to make something work:
 | `npm run build` | Type-checks, builds `web/dist` and release binaries (`app-all` and every service) |
 | `npm start` | Runs the release builds (by default turns into `app-all`); the edge serves the app and the API on http://localhost:{{ ports.EDGE_PORT }}. `node scripts/start.ts` keeps npm out of memory; `-- --check` prints the plan |
 | `npm test` | Vitest (web and scripts) + `cargo test --workspace` |
-| `npm run check` | The quality gate: ESLint + clippy, Prettier + rustfmt, vue-tsc, all tests, `npm run security` |
+| `npm run check` | The quality gate: ESLint + clippy, Prettier + rustfmt, vue-tsc, all tests, `npm run walls`, `npm run security` |
+| `npm run walls` | `walls check` (see Quality walls); without walls it fails, in CI too (install: `npm link` in `~/Documents/walls`); only `WALLS_OPTIONAL=1` skips it with a notice, never set it to get a green check |
 | `npm run security` | `secbase check` (`secbase.json`); without secbase it fails, in CI too (install: `npm link` in `~/Documents/secbase`); only `SECBASE_OPTIONAL=1` skips it with a notice, never set it to get a green check |
 | `npm run lint` / `npm run format` | Lint only / format everything (Prettier + `cargo fmt`) |
 | `cargo test -p app-<name>` | Tests of one crate or service; `cargo test -p app-all`: the whole app in all three modes |
@@ -142,7 +154,7 @@ Handler in the service's `routes.rs` (or a new module), validation in `model.rs`
 - **Data:** `DOCKER_DATA` in `.env` decides where the container keeps the SQLite database (`/app/data`): {% if choices.data == "local" %}**`./data`** — the project's `data/` folder is mounted (current setting); set `DOCKER_DATA=data` to use a Docker volume instead.{% else %}**`data`** — the named volume `{{ project.slug }}_data` (current setting); `docker compose down -v` deletes it. Set `DOCKER_DATA=./data` to keep the files in the project's `data/` folder instead.{% endif %}
 - Commands: `docker compose up --build`, `docker compose logs -f`, `docker compose down` (add `-v` to delete the volume).
 - Compose publishes `EDGE_PORT` on the host's `127.0.0.1` only; reach it from outside through a tunnel or a reverse proxy, never by publishing on all interfaces.
-- **Security gate:** the image has no secbase and never runs the checks: in Docker mode you must still run `npm run check` (it ends with `npm run security`) on the host.
+- **Security and quality gates:** the image has no secbase or walls and never runs the checks: in Docker mode you must still run `npm run check` (it runs `npm run walls` and `npm run security`) on the host.
 {%- endif %}
 
 ---
